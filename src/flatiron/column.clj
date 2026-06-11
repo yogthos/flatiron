@@ -1,5 +1,7 @@
 (ns flatiron.column)
 
+(set! *warn-on-reflection* true)
+
 ;; ── Protocol ──────────────────────────────────────────────────────────
 (defprotocol PColumn
   (-len        [this]               "Number of rows")
@@ -11,7 +13,7 @@
   (-slice      [this offset len]    "Zero-copy sub-view sharing the backing array"))
 
 ;; ── Null sentinels ────────────────────────────────────────────────────
-(def NULL_I64 Long/MIN_VALUE)
+(def ^:const NULL_I64 Long/MIN_VALUE)
 
 ;; ── I64Column ─────────────────────────────────────────────────────────
 (deftype I64Column [^longs data ^long len ^long offset ^boolean has-nulls]

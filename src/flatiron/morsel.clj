@@ -1,7 +1,10 @@
 (ns flatiron.morsel
   "Morsel iterator protocol — batches rows into reusable primitive buffers
    so that inner loops avoid per-element protocol dispatch."
-  (:require [flatiron.column :as col]))
+  (:require [flatiron.column :as col])
+  (:import [flatiron.column I64Column F64Column BoolColumn SymColumn StrColumn]))
+
+(set! *warn-on-reflection* true)
 
 (def ^:const MORSEL-SIZE 1024)
 
@@ -32,7 +35,7 @@
   (morsel-next-obj!  [_ _ _ _]  0)
   (morsel-reset! [_] (set! cursor 0)))
 
-(defn i64-morsel-source [col]
+(defn i64-morsel-source [^I64Column col]
   (I64MorselSource. (.data col) (.len col) (.offset col) 0))
 
 ;; ── F64MorselSource ───────────────────────────────────────────────────
@@ -53,7 +56,7 @@
   (morsel-next-obj!  [_ _ _ _]  0)
   (morsel-reset! [_] (set! cursor 0)))
 
-(defn f64-morsel-source [col]
+(defn f64-morsel-source [^F64Column col]
   (F64MorselSource. (.data col) (.len col) (.offset col) 0))
 
 ;; ── BoolMorselSource ──────────────────────────────────────────────────
@@ -74,7 +77,7 @@
   (morsel-next-obj! [_ _ _ _]  0)
   (morsel-reset! [_] (set! cursor 0)))
 
-(defn bool-morsel-source [col]
+(defn bool-morsel-source [^BoolColumn col]
   (BoolMorselSource. (.data col) (.len col) (.offset col) 0))
 
 ;; ── Sym/Str MorselSource (object array) ───────────────────────────────
@@ -96,12 +99,11 @@
   (morsel-reset! [_] (set! cursor 0)))
 
 (defn obj-morsel-source [col]
-  (let [tag    (col/-type-tag col)
-        data   (if (#{:sym :str} tag)
-                 (.data col)
-                 (throw (IllegalArgumentException.
-                         (str "ObjMorselSource requires :sym or :str column, got " tag))))
-        offset (if (= :sym tag)
-                 (.offset ^flatiron.column.SymColumn col)
-                 (.offset ^flatiron.column.StrColumn col))]
-    (ObjMorselSource. data (col/-len col) offset 0)))
+  (case (col/-type-tag col)
+    :sym (let [^SymColumn c col]
+           (ObjMorselSource. (.data c) (.len c) (.offset c) 0))
+    :str (let [^StrColumn c col]
+           (ObjMorselSource. (.data c) (.len c) (.offset c) 0))
+    (throw (IllegalArgumentException.
+            (str "ObjMorselSource requires :sym or :str column, got "
+                 (col/-type-tag col))))))

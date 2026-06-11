@@ -6,6 +6,8 @@
             [flatiron.morsel :as m])
   (:import [flatiron.column I64Column F64Column]))
 
+(set! *warn-on-reflection* true)
+
 ;; ════════════════════════════════════════════════════════════════════════
 ;; I64 aggregations
 ;; ════════════════════════════════════════════════════════════════════════
@@ -22,12 +24,14 @@
           (let [cnt (m/morsel-next-i64! ms buf 0 m/MORSEL-SIZE)]
             (if (zero? cnt)
               total
-              (recur (loop [i 0, acc total]
-                       (if (< i cnt)
-                         (let [v (aget buf i)]
-                           (recur (unchecked-inc i)
-                                  (if (= v null-sent) acc (unchecked-add acc v))))
-                         acc)))))))
+              ;; the long cast keeps the outer loop arg primitive — a bare
+              ;; loop in expression position compiles to a boxed fn call
+              (recur (long (loop [i 0, acc total]
+                             (if (< i cnt)
+                               (let [v (aget buf i)]
+                                 (recur (unchecked-inc i)
+                                        (if (= v null-sent) acc (unchecked-add acc v))))
+                               acc))))))))
       (let [^I64Column c col
             ^longs data (.data c)
             off (.offset c)
@@ -146,7 +150,7 @@
     (if (zero? n)
       nil
       (if has-n
-        (loop [i (int 0), best Double/MAX_VALUE, found false]
+        (loop [i (int 0), best Double/POSITIVE_INFINITY, found false]
           (if (< i n)
             (let [v (aget data (+ off i))]
               (if (Double/isNaN v)
@@ -170,7 +174,7 @@
     (if (zero? n)
       nil
       (if has-n
-        (loop [i (int 0), best (- Double/MAX_VALUE), found false]
+        (loop [i (int 0), best Double/NEGATIVE_INFINITY, found false]
           (if (< i n)
             (let [v (aget data (+ off i))]
               (if (Double/isNaN v)

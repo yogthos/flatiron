@@ -3,7 +3,9 @@
 
    Based on wyhash final version 4.2 by Wang Yi.
    Deterministic (seed=0) for repeatable hashing within a process."
-  (:import [clojure.lang Numbers]))
+  (:refer-clojure :exclude [hash-combine]))
+
+(set! *warn-on-reflection* true)
 
 ;; ── Secret constants (from wyhash final4.2) ────────────────────────────
 ;; Force to primitive long — hex literals with high bit set overflow to BigInt
@@ -12,40 +14,23 @@
 (def ^:const wyp2 (unchecked-long 0x4b33a62ed433d4a3))
 (def ^:const wyp3 (unchecked-long 0x4d5a2da51de1aa47))
 
-;; ── 128-bit multiply (low 64 bits returned, high 64 bits stored in *hi*) ──
-;; Java doesn't have 128-bit ints, but Clojure auto-promotes to BigInt.
-;; We use BigInteger for the full 128-bit product.
-(def ^:private ^java.math.BigInteger MASK64
-  (.subtract (.shiftLeft BigInteger/ONE 64) BigInteger/ONE))
-
-(defn- to-unsigned-bigint
-  "Convert a signed long to an unsigned BigInteger."
-  ^java.math.BigInteger [^long v]
-  (if (>= v 0)
-    (BigInteger/valueOf v)
-    (.add (BigInteger/valueOf (bit-and v Long/MAX_VALUE))
-          (.shiftLeft BigInteger/ONE 63))))
+;; ── 128-bit multiply ───────────────────────────────────────────────────
+;; Math/unsignedMultiplyHigh (JDK 18+, intrinsified) gives the high 64 bits
+;; of the unsigned product; unchecked-multiply gives the low 64 bits.
 
 (defn wymum
   "128-bit multiply: returns [lo hi] as a vector of two longs.
    (A * B) → [(low 64 bits) (high 64 bits)]"
   ^longs [^long a ^long b]
-  (let [au (to-unsigned-bigint a)
-        bu (to-unsigned-bigint b)
-        prod (.multiply au bu)
-        lo (.and prod MASK64)
-        hi (.shiftRight prod 64)]
-    (doto (long-array 2)
-      (aset 0 (.longValue lo))
-      (aset 1 (.longValue hi)))))
+  (doto (long-array 2)
+    (aset 0 (unchecked-multiply a b))
+    (aset 1 (Math/unsignedMultiplyHigh a b))))
 
 (defn wymix
   "Mix two 64-bit values via multiply-then-xor. Returns uint64 as long."
   ^long [^long a ^long b]
-  (let [ab (wymum a b)
-        lo (aget ab 0)
-        hi (aget ab 1)]
-    (bit-xor lo hi)))
+  (bit-xor (unchecked-multiply a b)
+           (Math/unsignedMultiplyHigh a b)))
 
 ;; ── Hash functions ─────────────────────────────────────────────────────
 
@@ -55,9 +40,8 @@
   ^long [^long val]
   (let [A  (bit-xor val wyp0)
         B  (bit-xor val wyp1)
-        ab (wymum A B)
-        lo (aget ab 0)
-        hi (aget ab 1)]
+        lo (unchecked-multiply A B)
+        hi (Math/unsignedMultiplyHigh A B)]
     (wymix (bit-xor lo wyp0)
            (bit-xor hi wyp1))))
 
@@ -70,9 +54,8 @@
         bits (Double/doubleToLongBits v)
         A    (bit-xor bits wyp0)
         B    (bit-xor bits wyp1)
-        ab   (wymum A B)
-        lo   (aget ab 0)
-        hi   (aget ab 1)]
+        lo   (unchecked-multiply A B)
+        hi   (Math/unsignedMultiplyHigh A B)]
     (wymix (bit-xor lo wyp0)
            (bit-xor hi wyp1))))
 
@@ -83,9 +66,8 @@
   ^long [^long h1 ^long h2]
   (let [A  (bit-xor h1 wyp0)
         B  (bit-xor h2 wyp1)
-        ab (wymum A B)
-        lo (aget ab 0)
-        hi (aget ab 1)]
+        lo (unchecked-multiply A B)
+        hi (Math/unsignedMultiplyHigh A B)]
     (wymix (bit-xor lo wyp0)
            (bit-xor hi wyp1))))
 

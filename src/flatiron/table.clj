@@ -1,6 +1,8 @@
 (ns flatiron.table
   (:require [flatiron.column :as col]))
 
+(set! *warn-on-reflection* true)
+
 ;; ── Table = ordered schema (keyword array) + columns (PColumn array) ──
 (defrecord Table [^objects schema     ;; array of keywords
                   ^objects columns    ;; array of PColumn
@@ -22,12 +24,12 @@
 (defn ^long nrows [^Table t]
   (if (zero? (.ncols t))
     0
-    (col/-len (aget (.columns t) 0))))
+    (col/-len (aget ^objects (.columns t) 0))))
 
 (defn col-idx
   "Find the index of a column by keyword. Returns -1 if not found."
   [^Table t kw]
-  (let [schema (.schema t)]
+  (let [^objects schema (.schema t)]
     (loop [i 0]
       (if (< i (alength schema))
         (if (= kw (aget schema i))
@@ -40,14 +42,14 @@
   [^Table t kw]
   (let [idx (col-idx t kw)]
     (when (>= idx 0)
-      (aget (.columns t) idx))))
+      (aget ^objects (.columns t) idx))))
 
 (defn col-by-idx
   "Get a column by integer index."
   [^Table t ^long idx]
-  (aget (.columns t) idx))
+  (aget ^objects (.columns t) idx))
 
 (defn col-name
   "Get the keyword name of a column by index."
   [^Table t ^long idx]
-  (aget (.schema t) idx))
+  (aget ^objects (.schema t) idx))
