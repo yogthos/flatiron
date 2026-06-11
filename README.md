@@ -46,13 +46,13 @@ A **Table** is a schema (vector of keyword column names) plus a vector of column
 (require '[flatiron.column :as col])
 (require '[flatiron.table :as tbl])
 
-(let [symbols (col/sym-column ["AAPL" "GOOG" "MSFT" "AAPL" "GOOG"])
-      qty     (col/i64-column [100    200    150    300    250])
-      table   (tbl/table [:Symbol :Qty] [symbols qty])]
+(let [dragons (col/sym-column [:smaug :fafnir :tiamat :smaug :fafnir])
+      gold    (col/i64-column [9000   750     1200    3100   2400])
+      table   (tbl/table [:Dragon :Gold] [dragons gold])]
 
   (tbl/nrows table)  ;; => 5
   (tbl/ncols table)  ;; => 2
-  (tbl/col table :Qty))  ;; => #<I64Column ...>
+  (tbl/col table :Gold))  ;; => #<I64Column ...> — Smaug is hoarding again
 ```
 
 ### Filtering
