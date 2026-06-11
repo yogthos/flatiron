@@ -3,6 +3,8 @@
             [flatiron.table :as tbl])
   (:import [flatiron.column I64Column F64Column]))
 
+(set! *warn-on-reflection* true)
+
 (defrecord Graph [^longs fwd-offsets ^longs fwd-targets
                   ^longs rev-offsets ^longs rev-targets
                   ^long n-nodes ^long n-edges ^doubles weights])
@@ -48,8 +50,8 @@
    (let [^I64Column sc src-col
          ^I64Column dc dst-col
          n-edges (.len sc)
-         sd (.data sc) so (.offset sc)
-         dd (.data dc) do (.offset dc)
+         ^longs sd (.data sc) so (.offset sc)
+         ^longs dd (.data dc) do (.offset dc)
          src (long-array n-edges) dst (long-array n-edges)]
      (dotimes [i n-edges]
        (aset src i (aget sd (+ so i)))
@@ -62,7 +64,7 @@
                             (unchecked-inc @mx)))))
            wts (when weight-col
                  (let [^F64Column wc weight-col
-                       wd (.data wc) wo (.offset wc)
+                       ^doubles wd (.data wc) wo (.offset wc)
                        out (double-array n-edges)]
                    (dotimes [i n-edges] (aset out i (aget wd (+ wo i))))
                    out))
@@ -87,7 +89,7 @@
 
 (defn neighbors [^Graph g ^long n]
   (let [^longs off (.fwd-offsets g) ^longs tgt (.fwd-targets g)
-        wts (.weights g) start (aget off n) end (aget off (unchecked-inc n))]
+        ^doubles wts (.weights g) start (aget off n) end (aget off (unchecked-inc n))]
     (for [i (range start end)]
       [(aget tgt i) (if wts (aget wts i) 1.0)])))
 
@@ -276,7 +278,7 @@
                   (vswap! ml min (aget label (aget rt j)))
                   (recur (unchecked-inc j))))
               (when (< @ml (aget label v))
-                (aset label v @ml) (vreset! ch true))))
+                (aset label v (long @ml)) (vreset! ch true))))
           (recur @ch))))
     (let [nc (long-array nn) cc (long-array nn)]
       (dotimes [i nn] (aset nc i i) (aset cc i (aget label i)))

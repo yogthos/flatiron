@@ -11,6 +11,8 @@
             [flatiron.table :as tbl])
   (:import [flatiron.column I64Column F64Column BoolColumn]))
 
+(set! *warn-on-reflection* true)
+
 (def ^:const MORSEL-SIZE m/MORSEL-SIZE)
 (def ^:const DEFAULT-PARALLELISM 4)
 
@@ -50,7 +52,7 @@
        (a/thread
          (loop [i start, total 0]
            (if (< i end)
-             (let [v (col/-get-long icol i)]
+             (let [v (long (col/-get-long icol i))]
                (recur (unchecked-inc i)
                       (if (and has-nulls (= v null-sent))
                         total
@@ -59,7 +61,7 @@
      (loop [remaining (count ranges), total 0]
        (if (zero? remaining)
          total
-         (let [t (a/<!! result-chan)]
+         (let [t (long (a/<!! result-chan))]
            (recur (dec remaining) (unchecked-add total t))))))))
 
 ;; ════════════════════════════════════════════════════════════════════════
@@ -90,7 +92,7 @@
          (loop [remaining (count ranges), total 0]
            (if (zero? remaining)
              total
-             (let [c (a/<!! result-chan)]
+             (let [c (long (a/<!! result-chan))]
                (recur (dec remaining) (unchecked-add total c))))))
        :f64
        (let [^F64Column fcol col]
@@ -105,7 +107,7 @@
          (loop [remaining (count ranges), total 0]
            (if (zero? remaining)
              total
-             (let [c (a/<!! result-chan)]
+             (let [c (long (a/<!! result-chan))]
                (recur (dec remaining) (unchecked-add total c))))))
        ;; Non-nullable: every row counts
        n-rows))))
@@ -134,7 +136,7 @@
      (loop [remaining (count ranges), total 0]
        (if (zero? remaining)
          total
-         (let [c (a/<!! result-chan)]
+         (let [c (long (a/<!! result-chan))]
            (recur (dec remaining) (unchecked-add total c))))))))
 
 ;; ════════════════════════════════════════════════════════════════════════
@@ -156,7 +158,7 @@
        (a/thread
          (loop [i start, best Long/MAX_VALUE, found false]
            (if (< i end)
-             (let [v (col/-get-long icol i)]
+             (let [v (long (col/-get-long icol i))]
                (recur (unchecked-inc i)
                       (if (and has-nulls (= v null-sent)) best (min best v))
                       (or found (not (and has-nulls (= v null-sent))))))
@@ -166,7 +168,7 @@
          (when found best)
          (let [[b f] (a/<!! result-chan)]
            (recur (dec remaining)
-                  (if f (min best b) best)
+                  (if f (min best (long b)) best)
                   (or found f))))))))
 
 (defn parallel-i64-max
@@ -184,7 +186,7 @@
        (a/thread
          (loop [i start, best Long/MIN_VALUE, found false]
            (if (< i end)
-             (let [v (col/-get-long icol i)]
+             (let [v (long (col/-get-long icol i))]
                (recur (unchecked-inc i)
                       (if (and has-nulls (= v null-sent)) best (max best v))
                       (or found (not (and has-nulls (= v null-sent))))))
@@ -194,7 +196,7 @@
          (when found best)
          (let [[b f] (a/<!! result-chan)]
            (recur (dec remaining)
-                  (if f (max best b) best)
+                  (if f (max best (long b)) best)
                   (or found f))))))))
 
 ;; ════════════════════════════════════════════════════════════════════════
@@ -220,8 +222,8 @@
                local (long-array len)]
             (loop [i start]
               (if (< i end)
-               (let [av (col/-get-long a i)
-                     bv (col/-get-long b i)]
+               (let [av (long (col/-get-long a i))
+                     bv (long (col/-get-long b i))]
                  ;; Preserve row positions: write the null sentinel in place
                  ;; rather than compacting, so the result stays aligned with
                  ;; the inputs (matching arith/i64-add).
@@ -257,7 +259,7 @@
     (loop [r (count ranges), acc []]
       (if (zero? r) acc (recur (dec r) (conj acc (a/<!! ch)))))))
 
-(defn- merge-long-sum [^long n-groups parts]
+(defn- merge-long-sum ^longs [^long n-groups parts]
   (let [out (long-array n-groups)]
     (doseq [^longs p parts]
       (dotimes [g n-groups] (aset out g (unchecked-add (aget out g) (aget p g)))))
@@ -281,7 +283,7 @@
                                  (let [loc (long-array n-groups)]
                                    (loop [i s]
                                      (when (< i e)
-                                       (let [v (col/-get-long val-col i)]
+                                       (let [v (long (col/-get-long val-col i))]
                                          (when (or (not has-n) (not= v col/NULL_I64))
                                            (let [g (aget row-groups i)]
                                              (aset loc g (unchecked-add (aget loc g) v)))))
@@ -307,7 +309,7 @@
                                  (java.util.Arrays/fill loc Long/MAX_VALUE)
                                  (loop [i s]
                                    (when (< i e)
-                                     (let [v (col/-get-long val-col i)]
+                                     (let [v (long (col/-get-long val-col i))]
                                        (when (or (not has-n) (not= v col/NULL_I64))
                                          (let [g (aget row-groups i)]
                                            (aset loc g (min (aget loc g) v)))))
@@ -323,7 +325,7 @@
                                  (java.util.Arrays/fill loc Long/MIN_VALUE)
                                  (loop [i s]
                                    (when (< i e)
-                                     (let [v (col/-get-long val-col i)]
+                                     (let [v (long (col/-get-long val-col i))]
                                        (when (or (not has-n) (not= v col/NULL_I64))
                                          (let [g (aget row-groups i)]
                                            (aset loc g (max (aget loc g) v)))))
@@ -339,15 +341,15 @@
                                      cnts (long-array n-groups)]
                                  (loop [i s]
                                    (when (< i e)
-                                     (let [v (col/-get-long val-col i)]
+                                     (let [v (long (col/-get-long val-col i))]
                                        (when (or (not has-n) (not= v col/NULL_I64))
                                          (let [g (aget row-groups i)]
                                            (aset sums g (unchecked-add (aget sums g) v))
                                            (aset cnts g (unchecked-inc (aget cnts g))))))
                                      (recur (unchecked-inc i))))
                                  [sums cnts])))
-                     sum (merge-long-sum n-groups (map first parts))
-                     cnt (merge-long-sum n-groups (map second parts))
+                     ^longs sum (merge-long-sum n-groups (map first parts))
+                     ^longs cnt (merge-long-sum n-groups (map second parts))
                      out (double-array n-groups)]
                  (dotimes [g n-groups]
                    (aset out g (if (zero? (aget cnt g))
@@ -390,7 +392,7 @@
                                  (java.util.Arrays/fill loc Double/MAX_VALUE)
                                  (loop [i s]
                                    (when (< i e)
-                                     (let [v (col/-get-double val-col i)]
+                                     (let [v (double (col/-get-double val-col i))]
                                        (when-not (Double/isNaN v)
                                          (let [g (aget row-groups i)]
                                            (aset loc g (min (aget loc g) v)))))
@@ -406,7 +408,7 @@
                                  (java.util.Arrays/fill loc (- Double/MAX_VALUE))
                                  (loop [i s]
                                    (when (< i e)
-                                     (let [v (col/-get-double val-col i)]
+                                     (let [v (double (col/-get-double val-col i))]
                                        (when-not (Double/isNaN v)
                                          (let [g (aget row-groups i)]
                                            (aset loc g (max (aget loc g) v)))))
@@ -430,7 +432,7 @@
                                      (recur (unchecked-inc i))))
                                  [sums cnts])))
                      sum (double-array n-groups)
-                     cnt (merge-long-sum n-groups (map second parts))
+                     ^longs cnt (merge-long-sum n-groups (map second parts))
                      out (double-array n-groups)]
                  (doseq [[^doubles ps _] parts] (dotimes [g n-groups] (aset sum g (+ (aget sum g) (aget ps g)))))
                  (dotimes [g n-groups]

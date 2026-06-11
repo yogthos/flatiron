@@ -1,6 +1,6 @@
 # Flatiron
 
-<img src="img/logo.svg" alt="Flatiron logo" width="800" />
+<img src="img/logo.svg" alt="Flatiron logo" width="400" />
 
 Flatiron is a columnar analytics library for Clojure. It lets you run fast analytical queries on in-memory tables using a SQL-like DSL, and it handles graph algorithms on the same data. It's pure Clojure with no dependencies beyond core.async.
 
@@ -196,6 +196,33 @@ There are several good Clojure data libraries. Flatiron fills a specific niche:
 - **vs `tech.ml.dataset`** — TMD is more feature-rich (date handling, statistical functions, interop with many formats). Flatiron is smaller, has no native dependencies, and focuses on raw speed for a narrower set of operations.
 
 - **vs embedded databases (H2, SQLite)** — Databases give you SQL, transactions, and persistence. Flatiron gives you in-process data you can manipulate directly from Clojure without going through JDBC. If you already have data in Clojure data structures and just need fast analytics, Flatiron is less ceremony.
+
+## Benchmarks vs Rayforce (C)
+
+`bench/flatiron/rayforce_bench.clj` runs the same queries through Flatiron and
+through [Rayforce](https://github.com/RayforceDB/rayforce), the C17 engine
+Flatiron reimplements. Both engines read the same generated dataset; Rayforce
+is timed with its `timeit` builtin, Flatiron with `System/nanoTime`, minimum
+of 10 runs after warmup.
+
+```
+clojure -M:bench -m flatiron.rayforce-bench [path-to-rayforce-binary]
+```
+
+Results on an Apple M1 Max (JDK 26, Rayforce `make release`), 1M rows:
+
+| query                            | rayforce (C) | flatiron | flatiron par8 |
+|----------------------------------|-------------:|---------:|--------------:|
+| group-by Sym (100 groups), sum   |      0.91 ms | 21.6 ms  |       8.8 ms  |
+| group-by Sym, sum+count+avg      |      1.43 ms | 23.0 ms  |       8.6 ms  |
+| where Qty>500, group-by Sym sum  |      0.50 ms | 14.4 ms  |       7.1 ms  |
+| group-by Id (100K groups), sum   |      2.66 ms | 32.4 ms  |       7.4 ms  |
+| scalar sum, 1M i64               |      0.07 ms |  0.7 ms  |          —    |
+
+The C implementation is 3–10x faster than Flatiron's parallel path (it uses
+SIMD kernels, a custom allocator, and saturates memory bandwidth on scans).
+Flatiron's goal is to stay within an order of magnitude of C while remaining
+pure Clojure.
 
 ## Acknowledgments
 

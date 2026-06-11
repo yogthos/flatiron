@@ -4,6 +4,8 @@
  :aliases
  {:test {:extra-paths ["test"]
          :extra-deps {criterium/criterium {:mvn/version "0.4.6"}}}
+  ;; Benchmarks vs the original C implementation: see bench/flatiron/rayforce_bench.clj
+  :bench {:extra-paths ["bench"]}
   ;; Throughput-oriented JVM profile for batch analytics (JDK 25+):
   ;; ParallelGC beats G1/ZGC for pure-throughput batch work, AlwaysPreTouch
   ;; moves page-fault cost to startup, compact object headers (JEP 519)

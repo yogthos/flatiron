@@ -1,0 +1,54 @@
+name: CI
+
+on: [push, pull_request]
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        # Math/unsignedMultiplyHigh (flatiron.hash) needs JDK 18+
+        java: ['21', '25']
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'temurin'
+          java-version: ${{ matrix.java }}
+
+      - name: Install Clojure CLI
+        uses: DeLaGuardo/setup-clojure@13
+        with:
+          cli: latest
+
+      - name: Cache dependencies
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.m2
+            ~/.gitlibs
+          key: deps-${{ matrix.java }}-${{ hashFiles('deps.edn') }}
+
+      - name: Run tests (fail on reflection warnings)
+        run: |
+          # Capture test exit code — don't let set -e stop us before checking for warnings
+          set +e -o pipefail
+          clojure -M:test -m flatiron.test-runner 2>&1 | tee test-output.log
+          TEST_EXIT=$?
+          set -e
+          REFLECTION_WARNINGS=$(grep -c "Reflection warning" test-output.log || true)
+          if [ "$REFLECTION_WARNINGS" -gt 0 ]; then
+            echo ""
+            echo "^^^ FAIL: $REFLECTION_WARNINGS reflection warning(s) detected. Fix them before merging."
+            grep -n "Reflection warning" test-output.log
+            exit 1
+          fi
+          if [ "$TEST_EXIT" -ne 0 ]; then
+            echo ""
+            echo "^^^ FAIL: Tests failed (exit code $TEST_EXIT)."
+            exit "$TEST_EXIT"
+          fi

@@ -6,6 +6,8 @@
             [flatiron.morsel :as m])
   (:import [flatiron.column I64Column F64Column]))
 
+(set! *warn-on-reflection* true)
+
 ;; ════════════════════════════════════════════════════════════════════════
 ;; I64 unary ops
 ;; ════════════════════════════════════════════════════════════════════════
@@ -21,7 +23,7 @@
         buf    (long-array m/MORSEL-SIZE)
         null-sent col/NULL_I64]
     (loop [dst-off 0]
-      (let [cnt (m/morsel-next-i64! ms buf 0 m/MORSEL-SIZE)]
+      (let [cnt (long (m/morsel-next-i64! ms buf 0 m/MORSEL-SIZE))]
         (if (zero? cnt)
           (I64Column. out n 0 has-n)
           (do
@@ -45,7 +47,7 @@
         buf    (long-array m/MORSEL-SIZE)
         null-sent col/NULL_I64]
     (loop [dst-off 0]
-      (let [cnt (m/morsel-next-i64! ms buf 0 m/MORSEL-SIZE)]
+      (let [cnt (long (m/morsel-next-i64! ms buf 0 m/MORSEL-SIZE))]
         (if (zero? cnt)
           (I64Column. out n 0 has-n)
           (do
@@ -72,7 +74,7 @@
         ms     (m/f64-morsel-source col)
         buf    (double-array m/MORSEL-SIZE)]
     (loop [dst-off 0]
-      (let [cnt (m/morsel-next-f64! ms buf 0 m/MORSEL-SIZE)]
+      (let [cnt (long (m/morsel-next-f64! ms buf 0 m/MORSEL-SIZE))]
         (if (zero? cnt)
           (F64Column. out n 0 has-n)
           (do
@@ -95,7 +97,7 @@
         ms     (m/f64-morsel-source col)
         buf    (double-array m/MORSEL-SIZE)]
     (loop [dst-off 0]
-      (let [cnt (m/morsel-next-f64! ms buf 0 m/MORSEL-SIZE)]
+      (let [cnt (long (m/morsel-next-f64! ms buf 0 m/MORSEL-SIZE))]
         (if (zero? cnt)
           (F64Column. out n 0 has-n)
           (do
@@ -121,8 +123,8 @@
         bbuf   (long-array m/MORSEL-SIZE)
         null-sent col/NULL_I64]
     (loop [dst-off 0]
-      (let [a-cnt (m/morsel-next-i64! ams abuf 0 m/MORSEL-SIZE)
-            b-cnt (m/morsel-next-i64! bms bbuf 0 m/MORSEL-SIZE)]
+      (let [a-cnt (long (m/morsel-next-i64! ams abuf 0 m/MORSEL-SIZE))
+            b-cnt (long (m/morsel-next-i64! bms bbuf 0 m/MORSEL-SIZE))]
         (assert (= a-cnt b-cnt) "Column length mismatch")
         (if (zero? a-cnt)
           (I64Column. out n 0 has-n)
@@ -134,9 +136,9 @@
                   (aset out (+ dst-off i)
                         (if (or (= a null-sent) (= b null-sent))
                           null-sent
-                          (op a b)))))
+                          (long (op a b))))))
               (dotimes [i a-cnt]
-                (aset out (+ dst-off i) (op (aget abuf i) (aget bbuf i)))))
+                (aset out (+ dst-off i) (long (op (aget abuf i) (aget bbuf i))))))
             (recur (+ dst-off a-cnt))))))))
 
 (defn i64-add [a b] (i64-binary-op + a b))
@@ -157,8 +159,8 @@
         bbuf   (long-array m/MORSEL-SIZE)
         null-sent col/NULL_I64]
     (loop [dst-off 0]
-      (let [a-cnt (m/morsel-next-i64! ams abuf 0 m/MORSEL-SIZE)
-            b-cnt (m/morsel-next-i64! bms bbuf 0 m/MORSEL-SIZE)]
+      (let [a-cnt (long (m/morsel-next-i64! ams abuf 0 m/MORSEL-SIZE))
+            b-cnt (long (m/morsel-next-i64! bms bbuf 0 m/MORSEL-SIZE))]
         (assert (= a-cnt b-cnt) "Column length mismatch")
         (if (zero? a-cnt)
           (F64Column. out n 0 has-n)
@@ -196,8 +198,8 @@
         abuf   (double-array m/MORSEL-SIZE)
         bbuf   (double-array m/MORSEL-SIZE)]
     (loop [dst-off 0]
-      (let [a-cnt (m/morsel-next-f64! ams abuf 0 m/MORSEL-SIZE)
-            b-cnt (m/morsel-next-f64! bms bbuf 0 m/MORSEL-SIZE)]
+      (let [a-cnt (long (m/morsel-next-f64! ams abuf 0 m/MORSEL-SIZE))
+            b-cnt (long (m/morsel-next-f64! bms bbuf 0 m/MORSEL-SIZE))]
         (assert (= a-cnt b-cnt) "Column length mismatch")
         (if (zero? a-cnt)
           (F64Column. out n 0 has-n)
@@ -209,9 +211,9 @@
                   (aset out (+ dst-off i)
                         (if (or (Double/isNaN av) (Double/isNaN bv))
                           Double/NaN
-                          (op av bv)))))
+                          (double (op av bv))))))
               (dotimes [i a-cnt]
-                (aset out (+ dst-off i) (op (aget abuf i) (aget bbuf i)))))
+                (aset out (+ dst-off i) (double (op (aget abuf i) (aget bbuf i))))))
             (recur (+ dst-off a-cnt))))))))
 
 (defn f64-add [a b] (f64-binary-op + a b))
@@ -231,8 +233,8 @@
         abuf   (double-array m/MORSEL-SIZE)
         bbuf   (double-array m/MORSEL-SIZE)]
     (loop [dst-off 0]
-      (let [a-cnt (m/morsel-next-f64! ams abuf 0 m/MORSEL-SIZE)
-            b-cnt (m/morsel-next-f64! bms bbuf 0 m/MORSEL-SIZE)]
+      (let [a-cnt (long (m/morsel-next-f64! ams abuf 0 m/MORSEL-SIZE))
+            b-cnt (long (m/morsel-next-f64! bms bbuf 0 m/MORSEL-SIZE))]
         (assert (= a-cnt b-cnt) "Column length mismatch")
         (if (zero? a-cnt)
           (F64Column. out n 0 has-n)

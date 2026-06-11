@@ -24,8 +24,8 @@
         bbuf   (long-array m/MORSEL-SIZE)
         null-sent col/NULL_I64]
     (loop [dst-off 0]
-      (let [a-cnt (m/morsel-next-i64! ams abuf 0 m/MORSEL-SIZE)
-            b-cnt (m/morsel-next-i64! bms bbuf 0 m/MORSEL-SIZE)]
+      (let [a-cnt (long (m/morsel-next-i64! ams abuf 0 m/MORSEL-SIZE))
+            b-cnt (long (m/morsel-next-i64! bms bbuf 0 m/MORSEL-SIZE))]
         (assert (= a-cnt b-cnt) "Column length mismatch")
         (if (zero? a-cnt)
           (BoolColumn. out n 0)
@@ -63,8 +63,8 @@
         abuf   (double-array m/MORSEL-SIZE)
         bbuf   (double-array m/MORSEL-SIZE)]
     (loop [dst-off 0]
-      (let [a-cnt (m/morsel-next-f64! ams abuf 0 m/MORSEL-SIZE)
-            b-cnt (m/morsel-next-f64! bms bbuf 0 m/MORSEL-SIZE)]
+      (let [a-cnt (long (m/morsel-next-f64! ams abuf 0 m/MORSEL-SIZE))
+            b-cnt (long (m/morsel-next-f64! bms bbuf 0 m/MORSEL-SIZE))]
         (assert (= a-cnt b-cnt) "Column length mismatch")
         (if (zero? a-cnt)
           (BoolColumn. out n 0)

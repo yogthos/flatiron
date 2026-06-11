@@ -5,7 +5,10 @@
   (:import [java.io DataOutputStream DataInputStream
             BufferedOutputStream BufferedInputStream
             FileOutputStream FileInputStream File]
-           [flatiron.column I64Column F64Column BoolColumn SymColumn StrColumn]))
+           [flatiron.column I64Column F64Column BoolColumn SymColumn StrColumn]
+           [flatiron.table Table]))
+
+(set! *warn-on-reflection* true)
 
 (defn- column-tag [c]
   (case (col/-type-tag c)
@@ -15,16 +18,16 @@
 ;; ── Save ──────────────────────────────────────────────────────────────
 
 (def save-table
-  (fn [table dir]
+  (fn [^Table table dir]
     (let [d (File. (str dir))
-          schema (.schema table)
+          ^objects schema (.schema table)
           nc (count (.schema table))]
       (.mkdirs d)
       (when (pos? nc)
-        (let [nr (col/-len (aget (.columns table) 0))]
+        (let [nr (long (col/-len (aget ^objects (.columns table) 0)))]
           (loop [c 0]
             (when (< c nc)
-              (let [col (aget (.columns table) c)
+              (let [col (aget ^objects (.columns table) c)
                     col-name (name (aget schema c))
                     stream (FileOutputStream. (File. d (str "col_" col-name)))
                     buf (BufferedOutputStream. stream)
@@ -59,13 +62,13 @@
         (let [col-names (mapv #(aget schema %) (range nc))]
           (spit (str dir "/_meta.edn")
                 (pr-str {:schema col-names
-                         :nrows (if (pos? nc) (col/-len (aget (.columns table) 0)) 0)}))))
+                         :nrows (if (pos? nc) (col/-len (aget ^objects (.columns table) 0)) 0)}))))
       dir)))
 
 ;; ── Load ──────────────────────────────────────────────────────────────
 
 (def ^:private read-column
-  (fn [f]
+  (fn [^File f]
     (let [in (DataInputStream. (BufferedInputStream. (FileInputStream. f)))
           tag (.readInt in)
           nr (.intValue (Long/valueOf (.readLong in)))

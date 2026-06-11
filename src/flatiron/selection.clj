@@ -1,11 +1,13 @@
 (ns flatiron.selection)
 
+(set! *warn-on-reflection* true)
+
 ;; ── Morsel constants ──────────────────────────────────────────────────
 (def ^:const morsel-elems 1024)
 (def ^:const bits-per-word 64)
 
 ;; ── Selection bitmap (three-level: segment flags + popcount + bits) ───
-(deftype Selection [seg-flags      ;; 0=all-dead, 1=all-live, 2=mixed — byte array
+(deftype Selection [^bytes seg-flags      ;; 0=all-dead, 1=all-live, 2=mixed — byte array
                     ^longs seg-popcnt     ;; cumulative popcount per segment
                     ^longs bits           ;; actual bits for mixed segments
                     ^long  n-rows])
@@ -28,10 +30,10 @@
   (.n-rows sel))
 
 (defn seg-flag ^long [^Selection sel ^long seg-idx]
-  (aget (.seg-flags sel) seg-idx))
+  (long (aget ^bytes (.seg-flags sel) seg-idx)))
 
 (defn seg-popcount ^long [^Selection sel ^long seg-idx]
-  (aget (.seg-popcnt sel) seg-idx))
+  (aget ^longs (.seg-popcnt sel) seg-idx))
 
 (defn selection-popcount ^long [^Selection sel]
   (let [s (n-segments (.n-rows sel))]
@@ -41,13 +43,13 @@
   "Check if a single row is live."
   [^Selection sel ^long idx]
   (let [seg-idx  (quot idx morsel-elems)
-        flag     (aget (.seg-flags sel) seg-idx)]
+        flag     (aget ^bytes (.seg-flags sel) seg-idx)]
     (case flag
       0 false
       1 true
       2 (let [word-idx (quot idx bits-per-word)
               bit-idx  (rem idx bits-per-word)]
-          (not (zero? (bit-and (aget (.bits sel) word-idx)
+          (not (zero? (bit-and (aget ^longs (.bits sel) word-idx)
                                (bit-shift-left 1 bit-idx))))))))
 
 ;; ── Mutation (for building filtering) ──────────────────────────────────
@@ -58,8 +60,8 @@
         word-idx  (quot idx bits-per-word)
         bit-idx   (rem idx bits-per-word)
         bit-mask  (bit-shift-left 1 bit-idx)
-        seg-flags (.seg-flags sel)
-        bits      (.bits sel)
+        ^bytes seg-flags (.seg-flags sel)
+        ^longs bits      (.bits sel)
         curr-flag (aget seg-flags seg-idx)]
     (when (zero? curr-flag)
       (if live?
@@ -102,25 +104,26 @@
 (defn recompute-popcounts!
   "Rebuild cumulative popcounts from segment flags and bits."
   [^Selection sel]
-  (let [seg-flags (.seg-flags sel)
-        pop       (.seg-popcnt sel)
-        bits      (.bits sel)
+  (let [^bytes seg-flags (.seg-flags sel)
+        ^longs pop       (.seg-popcnt sel)
+        ^longs bits      (.bits sel)
         n-segs'   (n-segments (.n-rows sel))
         n         (.n-rows sel)]
     (loop [seg-idx 0, cum 0]
       (when (< seg-idx n-segs')
         (let [s-end (seg-end seg-idx n)
               s-n   (- s-end (seg-start seg-idx))
-              cnt   (case (aget seg-flags seg-idx)
-                      0 0
-                      1 s-n
+              cnt   (long
+                     (case (aget seg-flags seg-idx)
+                       0 0
+                       1 s-n
                        2 (let [wstart (quot (seg-start seg-idx) bits-per-word)
                                wend   (quot (dec s-end) bits-per-word)]
                           (loop [wi wstart, sum 0]
                             (if (<= wi wend)
                               (recur (unchecked-inc wi)
                                      (+ sum (Long/bitCount (aget bits wi))))
-                              sum))))]
+                              sum)))))]
           (aset pop seg-idx (long (+ cum cnt)))
           (recur (unchecked-inc seg-idx) (+ cum cnt)))))))
 

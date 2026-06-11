@@ -5,6 +5,8 @@
             [flatiron.table :as tbl])
   (:import [flatiron.column I64Column F64Column BoolColumn SymColumn StrColumn]))
 
+(set! *warn-on-reflection* true)
+
 ;; ════════════════════════════════════════════════════════════════════════
 ;; Comparator construction
 ;; ════════════════════════════════════════════════════════════════════════
@@ -16,7 +18,7 @@
     (case (col/-type-tag col)
       :i64
       (let [^flatiron.column.I64Column c col
-            data (.data c)
+            ^longs data (.data c)
             offset (.offset c)]
         (reify java.util.Comparator
           (compare [_ a b]
@@ -25,7 +27,7 @@
               (* mult (Long/compare va vb))))))
       :f64
       (let [^flatiron.column.F64Column c col
-            data (.data c)
+            ^doubles data (.data c)
             offset (.offset c)]
         (reify java.util.Comparator
           (compare [_ a b]
@@ -34,7 +36,7 @@
               (* mult (Double/compare va vb))))))
       :sym
       (let [^flatiron.column.SymColumn c col
-            data (.data c)
+            ^objects data (.data c)
             offset (.offset c)]
         (reify java.util.Comparator
           (compare [_ a b]
@@ -46,7 +48,7 @@
                   (* mult (.compareTo ^Comparable va vb))))))))
       :str
       (let [^flatiron.column.StrColumn c col
-            data (.data c)
+            ^objects data (.data c)
             offset (.offset c)]
         (reify java.util.Comparator
           (compare [_ a b]
@@ -58,7 +60,7 @@
                   (* mult (.compareTo ^Comparable va vb))))))))
       :bool
       (let [^flatiron.column.BoolColumn c col
-            data (.data c)
+            ^bytes data (.data c)
             offset (.offset c)]
         (reify java.util.Comparator
           (compare [_ a b]
@@ -77,7 +79,7 @@
    Stable sort — preserves original order for equal keys."
   ^"[I" [col direction]
   (let [n (int (col/-len col))
-        idx (make-array Integer n)]
+        ^"[Ljava.lang.Integer;" idx (make-array Integer n)]
     (dotimes [i n] (aset idx i (Integer/valueOf i)))
     (java.util.Arrays/sort ^"[Ljava.lang.Integer;" idx (column-comparator col direction))
     (let [out (int-array n)]
@@ -107,7 +109,7 @@
   ^"[I" [key-specs]
   (let [first-col  (ffirst key-specs)
         n          (int (col/-len first-col))
-        idx        (make-array Integer n)
+        ^"[Ljava.lang.Integer;" idx (make-array Integer n)
         comps      (mapv (fn [[col dir]] (column-comparator col dir)) key-specs)
         comparator (chained-comparator comps)]
     (dotimes [i n] (aset idx i (Integer/valueOf i)))
@@ -127,7 +129,7 @@
     (case (col/-type-tag col)
       :i64
       (let [^flatiron.column.I64Column c col
-            src (.data c)
+            ^longs src (.data c)
             offset (.offset c)
             dst (long-array n)]
         (dotimes [i n]
@@ -135,7 +137,7 @@
         (I64Column. dst n 0 (.has-nulls c)))
       :f64
       (let [^flatiron.column.F64Column c col
-            src (.data c)
+            ^doubles src (.data c)
             offset (.offset c)
             dst (double-array n)]
         (dotimes [i n]
@@ -143,7 +145,7 @@
         (F64Column. dst n 0 (.has-nulls c)))
       :sym
       (let [^flatiron.column.SymColumn c col
-            src (.data c)
+            ^objects src (.data c)
             offset (.offset c)
             dst (object-array n)]
         (dotimes [i n]
@@ -151,7 +153,7 @@
         (SymColumn. dst n 0 (.has-nulls c)))
       :str
       (let [^flatiron.column.StrColumn c col
-            src (.data c)
+            ^objects src (.data c)
             offset (.offset c)
             dst (object-array n)]
         (dotimes [i n]
@@ -159,7 +161,7 @@
         (StrColumn. dst n 0 (.has-nulls c)))
       :bool
       (let [^flatiron.column.BoolColumn c col
-            src (.data c)
+            ^bytes src (.data c)
             offset (.offset c)
             dst (byte-array n)]
         (dotimes [i n]

@@ -4,6 +4,8 @@
             [flatiron.table :as tbl])
   (:import [flatiron.column I64Column F64Column]))
 
+(set! *warn-on-reflection* true)
+
 ;; Clojure 1.12.0 workaround: (long x) and (int x) fail in defn bodies
 ;; when x comes from an external function. Use RT methods directly.
 (defn- to-long ^long [x] (clojure.lang.RT/longCast x))
@@ -64,7 +66,7 @@
     :i64
     (let [^flatiron.column.I64Column typed col
           n (to-int (.len typed))
-          src (.data typed)
+          ^longs src (.data typed)
           off (.offset typed)
           ^longs dst (long-array n)
           def (if (nil? default) col/NULL_I64 (to-long default))]
@@ -75,7 +77,7 @@
     :f64
     (let [^flatiron.column.F64Column typed col
           n (to-int (.len typed))
-          src (.data typed)
+          ^doubles src (.data typed)
           off (.offset typed)
           dst (double-array n)
           def (if (nil? default) Double/NaN (double default))]
@@ -94,7 +96,7 @@
     :i64
     (let [^flatiron.column.I64Column typed col
           n (to-int (.len typed))
-          src (.data typed)
+          ^longs src (.data typed)
           off (.offset typed)
           ^longs dst (long-array n)
           def (if (nil? default) col/NULL_I64 (to-long default))]
@@ -105,7 +107,7 @@
     :f64
     (let [^flatiron.column.F64Column typed col
           n (to-int (.len typed))
-          src (.data typed)
+          ^doubles src (.data typed)
           off (.offset typed)
           dst (double-array n)
           def (if (nil? default) Double/NaN (double default))]
