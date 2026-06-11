@@ -5,7 +5,7 @@
             [clojure.test :as t]))
 
 (def ^:private hot-namespaces
-  "flatiron.column flatiron.morsel flatiron.hash flatiron.table flatiron.agg flatiron.group")
+  "flatiron.column flatiron.morsel flatiron.hash flatiron.table flatiron.agg flatiron.group flatiron.filter")
 
 (t/deftest ^:slow no-reflection-in-hot-namespaces
   (let [{:keys [exit err]}

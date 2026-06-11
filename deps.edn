@@ -3,4 +3,12 @@
         org.clojure/core.async {:mvn/version "1.6.681"}}
  :aliases
  {:test {:extra-paths ["test"]
-         :extra-deps {criterium/criterium {:mvn/version "0.4.6"}}}}}
+         :extra-deps {criterium/criterium {:mvn/version "0.4.6"}}}
+  ;; Throughput-oriented JVM profile for batch analytics (JDK 25+):
+  ;; ParallelGC beats G1/ZGC for pure-throughput batch work, AlwaysPreTouch
+  ;; moves page-fault cost to startup, compact object headers (JEP 519)
+  ;; shrink per-object overhead, direct linking removes var indirection.
+  :perf {:jvm-opts ["-XX:+UseParallelGC"
+                    "-XX:+AlwaysPreTouch"
+                    "-XX:+UseCompactObjectHeaders"
+                    "-Dclojure.compiler.direct-linking=true"]}}}

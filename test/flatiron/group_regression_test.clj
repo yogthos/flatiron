@@ -3,6 +3,7 @@
    aggregation/group-by optimization commit."
   (:require [flatiron.group :as g]
             [flatiron.column :as col]
+            [flatiron.filter :as filt]
             [flatiron.table :as tbl]
             [flatiron.agg :as agg]
             [clojure.test :as t]))
@@ -96,6 +97,32 @@
         presult (g/parallel-group-by table :keys [:k] :aggs [{:agg :sum :col :v :out :s}])]
     (t/is (= #{["a" 4] ["b" 2]} (result-rows result)))
     (t/is (= #{["a" 4] ["b" 2]} (result-rows presult)))))
+
+;; ── Fused filter+group-by: :where must equal filter-then-group ────────
+(t/deftest fused-where-group-by
+  (let [n 2000
+        rnd (java.util.Random. 7)
+        ks (repeatedly n #(let [x (.nextInt rnd 20)] (when (pos? x) (long x))))
+        vs (repeatedly n #(long (.nextInt rnd 1000)))
+        table (tbl/table [:k :v] [(col/i64-column ks) (col/i64-column vs)])
+        mask (filt/scalar-pred (tbl/col table :v) :gt 500)
+        aggs [{:agg :sum :col :v :out :s} {:agg :min :col :v :out :mn}]
+        expected (result-rows (g/group-by (filt/filter-rows table mask)
+                                          :keys [:k] :aggs aggs))]
+    (t/is (= expected (result-rows (g/group-by table :keys [:k] :aggs aggs
+                                               :where mask))))
+    (t/is (= expected (result-rows (g/parallel-group-by table :keys [:k] :aggs aggs
+                                                        :where mask))))))
+
+(t/deftest fused-where-empty-selection
+  (let [table (tbl/table [:k :v] [(col/i64-column [1 2]) (col/i64-column [3 4])])
+        mask (filt/scalar-pred (tbl/col table :v) :gt 100)]
+    (t/is (zero? (tbl/nrows (g/group-by table :keys [:k]
+                                        :aggs [{:agg :sum :col :v :out :s}]
+                                        :where mask))))
+    (t/is (zero? (tbl/nrows (g/parallel-group-by table :keys [:k]
+                                                 :aggs [{:agg :sum :col :v :out :s}]
+                                                 :where mask))))))
 
 ;; ── Equivalence: parallel must agree with single-threaded ─────────────
 (t/deftest parallel-equals-single-threaded

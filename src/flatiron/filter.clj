@@ -10,14 +10,14 @@
             [flatiron.table :as tbl])
   (:import [flatiron.column I64Column F64Column BoolColumn SymColumn StrColumn]))
 
-(defn- num-op [op x y]
+(set! *warn-on-reflection* true)
+
+;; Comparison ops resolve to an int code outside the row loop; the per-row
+;; dispatch is a tableswitch on a primitive, not a keyword lookup with
+;; boxed operands.
+(defn- op-code ^long [op]
   (case op
-    :gt (> x y)
-    :lt (< x y)
-    :ge (>= x y)
-    :le (<= x y)
-    :eq (== x y)
-    :ne (not (== x y))
+    :gt 0 :lt 1 :ge 2 :le 3 :eq 4 :ne 5
     (throw (IllegalArgumentException. (str "Unknown comparison op: " op)))))
 
 (defn scalar-pred
@@ -31,77 +31,107 @@
     (case (col/-type-tag col)
       :i64
       (let [^I64Column c col
-            data   (.data c)
+            ^longs data (.data c)
             offset (.offset c)
             hn     (.has-nulls c)
-            v      (long val)]
-        (dotimes [i n]
-          (let [x (aget data (+ offset i))]
-            (aset out i (byte (if (and hn (= x col/NULL_I64))
-                                0
-                                (if (num-op op x v) 1 0)))))))
+            v      (long val)
+            code   (op-code op)]
+        (loop [i (int 0)]
+          (when (< i n)
+            (let [x (aget data (+ offset i))
+                  pass (if (and hn (= x col/NULL_I64))
+                         false
+                         (case code
+                           0 (> x v) 1 (< x v) 2 (>= x v)
+                           3 (<= x v) 4 (== x v) 5 (not (== x v))))]
+              (aset out i (byte (if pass 1 0))))
+            (recur (unchecked-inc i)))))
       :f64
       (let [^F64Column c col
-            data   (.data c)
+            ^doubles data (.data c)
             offset (.offset c)
-            v      (double val)]
-        (dotimes [i n]
-          (let [x (aget data (+ offset i))]
-            (aset out i (byte (if (Double/isNaN x)
-                                0
-                                (if (num-op op x v) 1 0)))))))
+            v      (double val)
+            code   (op-code op)]
+        (loop [i (int 0)]
+          (when (< i n)
+            (let [x (aget data (+ offset i))
+                  pass (if (Double/isNaN x)
+                         false
+                         (case code
+                           0 (> x v) 1 (< x v) 2 (>= x v)
+                           3 (<= x v) 4 (== x v) 5 (not (== x v))))]
+              (aset out i (byte (if pass 1 0))))
+            (recur (unchecked-inc i)))))
       (:sym :str)
       (do
         (when-not (#{:eq :ne} op)
           (throw (IllegalArgumentException.
                   (str "Operator " op " not supported for " (col/-type-tag col) " columns"))))
-        (dotimes [i n]
-          (let [x (col/-get-obj col i)]
-            (aset out i (byte (if (nil? x)
-                                0
-                                (if (case op :eq (= x val) :ne (not= x val)) 1 0)))))))
+        (let [eq? (= op :eq)]
+          (loop [i (int 0)]
+            (when (< i n)
+              (let [x (col/-get-obj col i)
+                    pass (if (nil? x)
+                           false
+                           (if eq? (= x val) (not= x val)))]
+                (aset out i (byte (if pass 1 0))))
+              (recur (unchecked-inc i))))))
       :bool
       (do
         (when-not (#{:eq :ne} op)
           (throw (IllegalArgumentException.
                   (str "Operator " op " not supported for :bool columns"))))
-        (let [v (boolean val)]
-          (dotimes [i n]
-            (let [x (col/-get-obj col i)]
-              (aset out i (byte (if (case op :eq (= x v) :ne (not= x v)) 1 0)))))))
+        (let [^BoolColumn c col
+              ^bytes data (.data c)
+              offset (.offset c)
+              v (byte (if (boolean val) 1 0))
+              eq? (= op :eq)]
+          (loop [i (int 0)]
+            (when (< i n)
+              (let [x (aget data (+ offset i))]
+                (aset out i (byte (if (if eq? (== x v) (not (== x v))) 1 0))))
+              (recur (unchecked-inc i))))))
       (throw (IllegalArgumentException.
               (str "Unsupported column type for predicate: " (col/-type-tag col)))))
     (BoolColumn. out n 0)))
 
-(defn- bool-binop ^BoolColumn [^BoolColumn a ^BoolColumn b f]
+(defn- bool-binop ^BoolColumn [^BoolColumn a ^BoolColumn b and?]
   (let [n   (col/-len a)
         out (byte-array n)
-        ad  (.data a) ao (.offset a)
-        bd  (.data b) bo (.offset b)]
-    (dotimes [i n]
-      (aset out i (byte (if (f (= 1 (aget ad (+ ao i)))
-                              (= 1 (aget bd (+ bo i))))
-                          1 0))))
+        ^bytes ad (.data a) ao (.offset a)
+        ^bytes bd (.data b) bo (.offset b)]
+    (if and?
+      (loop [i (int 0)]
+        (when (< i n)
+          (aset out i (byte (bit-and (aget ad (+ ao i)) (aget bd (+ bo i)))))
+          (recur (unchecked-inc i))))
+      (loop [i (int 0)]
+        (when (< i n)
+          (aset out i (byte (bit-or (aget ad (+ ao i)) (aget bd (+ bo i)))))
+          (recur (unchecked-inc i)))))
     (BoolColumn. out n 0)))
 
 (defn bool-and
   "Element-wise AND of one or more BoolColumns."
   ^BoolColumn [c & cs]
-  (reduce #(bool-binop %1 %2 (fn [x y] (and x y))) c cs))
+  (reduce #(bool-binop %1 %2 true) c cs))
 
 (defn bool-or
   "Element-wise OR of one or more BoolColumns."
   ^BoolColumn [c & cs]
-  (reduce #(bool-binop %1 %2 (fn [x y] (or x y))) c cs))
+  (reduce #(bool-binop %1 %2 false) c cs))
 
 (defn bool-not
   "Element-wise NOT of a BoolColumn."
   ^BoolColumn [^BoolColumn c]
   (let [n   (col/-len c)
         out (byte-array n)
-        d   (.data c) o (.offset c)]
-    (dotimes [i n]
-      (aset out i (byte (if (= 1 (aget d (+ o i))) 0 1))))
+        ^bytes d (.data c)
+        o (.offset c)]
+    (loop [i (int 0)]
+      (when (< i n)
+        (aset out i (byte (bit-xor 1 (aget d (+ o i)))))
+        (recur (unchecked-inc i))))
     (BoolColumn. out n 0)))
 
 (defn- gather-rows
@@ -111,23 +141,38 @@
   (let [k (alength idx)]
     (case (col/-type-tag col)
       :i64
-      (let [^I64Column c col, src (.data c), offset (.offset c), dst (long-array k)]
+      (let [^I64Column c col
+            ^longs src (.data c)
+            offset (.offset c)
+            dst (long-array k)]
         (dotimes [i k] (aset dst i (aget src (+ offset (aget idx i)))))
         (I64Column. dst k 0 (.has-nulls c)))
       :f64
-      (let [^F64Column c col, src (.data c), offset (.offset c), dst (double-array k)]
+      (let [^F64Column c col
+            ^doubles src (.data c)
+            offset (.offset c)
+            dst (double-array k)]
         (dotimes [i k] (aset dst i (aget src (+ offset (aget idx i)))))
         (F64Column. dst k 0 (.has-nulls c)))
       :sym
-      (let [^SymColumn c col, src (.data c), offset (.offset c), dst (object-array k)]
+      (let [^SymColumn c col
+            ^objects src (.data c)
+            offset (.offset c)
+            dst (object-array k)]
         (dotimes [i k] (aset dst i (aget src (+ offset (aget idx i)))))
         (SymColumn. dst k 0 (.has-nulls c)))
       :str
-      (let [^StrColumn c col, src (.data c), offset (.offset c), dst (object-array k)]
+      (let [^StrColumn c col
+            ^objects src (.data c)
+            offset (.offset c)
+            dst (object-array k)]
         (dotimes [i k] (aset dst i (aget src (+ offset (aget idx i)))))
         (StrColumn. dst k 0 (.has-nulls c)))
       :bool
-      (let [^BoolColumn c col, src (.data c), offset (.offset c), dst (byte-array k)]
+      (let [^BoolColumn c col
+            ^bytes src (.data c)
+            offset (.offset c)
+            dst (byte-array k)]
         (dotimes [i k] (aset dst i (aget src (+ offset (aget idx i)))))
         (BoolColumn. dst k 0))
       (throw (IllegalArgumentException.
@@ -138,16 +183,17 @@
    Column order and types are preserved."
   [table ^BoolColumn mask]
   (let [n  (col/-len mask)
-        md (.data mask)
+        ^bytes md (.data mask)
         mo (.offset mask)
-        k  (loop [i 0, c 0]
+        k  (loop [i (int 0), c (int 0)]
              (if (< i n)
-               (recur (unchecked-inc i) (if (= 1 (aget md (+ mo i))) (unchecked-inc c) c))
+               (recur (unchecked-inc i)
+                      (if (== 1 (aget md (+ mo i))) (unchecked-inc c) c))
                c))
         idx (int-array k)]
-    (loop [i 0, j 0]
+    (loop [i (int 0), j (int 0)]
       (when (< i n)
-        (if (= 1 (aget md (+ mo i)))
+        (if (== 1 (aget md (+ mo i)))
           (do (aset idx j i) (recur (unchecked-inc i) (unchecked-inc j)))
           (recur (unchecked-inc i) j))))
     (let [ncols    (tbl/ncols table)

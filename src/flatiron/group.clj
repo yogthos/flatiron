@@ -3,15 +3,45 @@
    Two-pass single-threaded: Pass 1 builds group assignment,
    Pass 2 accumulates aggregation values per group.
    Parallel variant radix-partitions rows by the high bits of the key hash
-   and processes disjoint partitions on worker threads."
+   and processes disjoint partitions on a shared ForkJoin pool; the hash,
+   histogram and scatter phases are chunk-parallel as well."
   (:refer-clojure :exclude [group-by])
-  (:require [clojure.core.async :as a]
-            [flatiron.column :as col]
+  (:require [flatiron.column :as col]
             [flatiron.hash :as h]
             [flatiron.table :as tbl])
-  (:import [flatiron.column I64Column F64Column BoolColumn SymColumn StrColumn]))
+  (:import [flatiron.column I64Column F64Column BoolColumn SymColumn StrColumn]
+           [java.util.concurrent Callable ExecutionException ForkJoinPool Future]))
 
 (set! *warn-on-reflection* true)
+
+;; ════════════════════════════════════════════════════════════════════════
+;; Worker pool
+;; ════════════════════════════════════════════════════════════════════════
+
+(defonce ^:private ^ForkJoinPool worker-pool
+  (ForkJoinPool. (max 2 (.availableProcessors (Runtime/getRuntime)))))
+
+(defn- invoke-tasks
+  "Run thunks on the worker pool; returns their results in input order.
+   Worker exceptions are rethrown on the calling thread."
+  [fns]
+  (let [futs (.invokeAll worker-pool
+                         ^java.util.Collection
+                         (mapv (fn [f] (reify Callable (call [_] (f)))) fns))]
+    (mapv (fn [^Future fu]
+            (try (.get fu)
+                 (catch ExecutionException e
+                   (throw (or (.getCause e) e)))))
+          futs)))
+
+(defn- chunk-ranges
+  "Split [0, n) into up to n-chunks contiguous [start end) ranges."
+  [^long n ^long n-chunks]
+  (let [size (max 1 (quot (+ n n-chunks -1) n-chunks))]
+    (loop [s 0, acc []]
+      (if (< s n)
+        (recur (+ s size) (conj acc [s (min n (+ s size))]))
+        acc))))
 
 ;; ════════════════════════════════════════════════════════════════════════
 ;; Fast hashing — avoid BigInteger wyhash for prehash step
@@ -57,69 +87,81 @@
     (.offset ^StrColumn c)))
 
 ;; ════════════════════════════════════════════════════════════════════════
-;; Prehashing
+;; Prehashing — range-based kernels so chunks can run in parallel
 ;; ════════════════════════════════════════════════════════════════════════
 
-(defn- prehash-i64-column ^longs [key-col]
+(defn- prehash-i64-range! [key-col ^longs out combine? start end]
   (let [^I64Column c key-col
         ^longs data (.data c)
         off (.offset c)
-        n (.len c)
-        out (long-array n)]
-    (loop [i (int 0)]
-      (when (< i n)
-        (aset out i (fast-long-hash (aget data (+ off i))))
-        (recur (unchecked-inc i))))
-    out))
+        start (long start)
+        end (long end)]
+    (if combine?
+      (loop [i start]
+        (when (< i end)
+          (aset out i (h/hash-combine (aget out i)
+                                      (fast-long-hash (aget data (+ off i)))))
+          (recur (unchecked-inc i))))
+      (loop [i start]
+        (when (< i end)
+          (aset out i (fast-long-hash (aget data (+ off i))))
+          (recur (unchecked-inc i)))))))
 
-(defn- prehash-f64-column ^longs [key-col]
+(defn- prehash-f64-range! [key-col ^longs out combine? start end]
   (let [^F64Column c key-col
         ^doubles data (.data c)
         off (.offset c)
-        n (.len c)
-        out (long-array n)]
-    (loop [i (int 0)]
-      (when (< i n)
-        (aset out i (fast-double-hash (aget data (+ off i))))
-        (recur (unchecked-inc i))))
-    out))
+        start (long start)
+        end (long end)]
+    (if combine?
+      (loop [i start]
+        (when (< i end)
+          (aset out i (h/hash-combine (aget out i)
+                                      (fast-double-hash (aget data (+ off i)))))
+          (recur (unchecked-inc i))))
+      (loop [i start]
+        (when (< i end)
+          (aset out i (fast-double-hash (aget data (+ off i))))
+          (recur (unchecked-inc i)))))))
 
-(defn- prehash-obj-column ^longs [key-col]
+(defn- prehash-obj-range! [key-col ^longs out combine? start end]
   (let [^objects data (obj-data key-col)
         off (obj-offset key-col)
-        n (col/-len key-col)
-        out (long-array n)]
-    (loop [i (int 0)]
-      (when (< i n)
-        (let [obj (aget data (+ off i))
-              hc (if (nil? obj) 0 (.hashCode ^Object obj))]
-          (aset out i (fast-int-hash hc))
-          (recur (unchecked-inc i)))))
-    out))
+        start (long start)
+        end (long end)]
+    (if combine?
+      (loop [i start]
+        (when (< i end)
+          (let [obj (aget data (+ off i))
+                hc (if (nil? obj) 0 (.hashCode ^Object obj))]
+            (aset out i (h/hash-combine (aget out i) (fast-int-hash hc))))
+          (recur (unchecked-inc i))))
+      (loop [i start]
+        (when (< i end)
+          (let [obj (aget data (+ off i))
+                hc (if (nil? obj) 0 (.hashCode ^Object obj))]
+            (aset out i (fast-int-hash hc)))
+          (recur (unchecked-inc i)))))))
 
-(defn- prehash-column ^longs [key-col]
+(defn- prehash-range! [key-col ^longs out combine? start end]
   (case (col/-type-tag key-col)
-    :i64 (prehash-i64-column key-col)
-    :f64 (prehash-f64-column key-col)
-    (:sym :str) (prehash-obj-column key-col)
+    :i64 (prehash-i64-range! key-col out combine? start end)
+    :f64 (prehash-f64-range! key-col out combine? start end)
+    (:sym :str) (prehash-obj-range! key-col out combine? start end)
     (throw (IllegalArgumentException.
             (str "Unsupported group-by key type: " (col/-type-tag key-col))))))
 
-(defn- combined-hashes
-  "Per-row hash combined across all key columns. Returns long[nrows].
-   Single key returns its (fresh) prehash array directly."
-  ^longs [key-cols]
-  (let [nkeys (count key-cols)
-        ^longs out (prehash-column (first key-cols))
-        nrows (alength out)]
-    (loop [k 1]
-      (when (< k nkeys)
-        (let [^longs kh (prehash-column (nth key-cols k))]
-          (loop [i (int 0)]
-            (when (< i nrows)
-              (aset out i (h/hash-combine (aget out i) (aget kh i)))
-              (recur (unchecked-inc i)))))
-        (recur (unchecked-inc k))))
+(defn- combined-hashes-range!
+  "Fill out[start..end) with the per-row hash combined across all key columns."
+  [key-cols ^longs out start end]
+  (prehash-range! (first key-cols) out false start end)
+  (doseq [k (rest key-cols)]
+    (prehash-range! k out true start end)))
+
+(defn- combined-hashes ^longs [key-cols]
+  (let [n (col/-len (first key-cols))
+        out (long-array n)]
+    (combined-hashes-range! key-cols out 0 n)
     out))
 
 ;; ════════════════════════════════════════════════════════════════════════
@@ -152,11 +194,54 @@
 ;; Hash table build
 ;; ════════════════════════════════════════════════════════════════════════
 
-(defn- build-groups-hashed
-  "Assign each row a group-id via an open-addressing hash table.
-   Slots are matched on the combined hash and then verified by comparing the
-   actual key values, so hash collisions never merge distinct keys.
-   Returns [n-groups row-groups]."
+(defn- build-groups-salt
+  "Open-addressing build with 4-byte salt-packed slots (rayforce-style):
+   bits 24-31 of a slot hold a salt taken from hash bits 40-47 — disjoint
+   from both the slot-index low bits and the radix-partition high bits —
+   and bits 0-23 hold the group id. A probe compares the salt first and
+   verifies actual key values on a match, so collisions never merge
+   distinct keys. 4-byte slots quadruple probe cache density vs the
+   previous hash+row+group arrays. Requires nrows < 2^24-1 so a live
+   entry can never equal the -1 empty sentinel."
+  [key-cols ^longs hashes]
+  (let [nrows  (long (col/-len (first key-cols)))
+        nkeys  (long (count key-cols))
+        kcols  (object-array key-cols)
+        cap    (h/ht-capacity nrows)
+        cap-mask (unchecked-dec cap)
+        slots  (int-array cap)
+        rep    (int-array nrows)     ;; gid → representative row
+        row-groups (int-array nrows)]
+    (java.util.Arrays/fill slots (int -1))
+    (let [n-groups
+          (long
+           (loop [row 0, gid 0]
+             (if (< row nrows)
+               (let [hv (aget hashes row)
+                     salt (bit-and (unsigned-bit-shift-right hv 40) 0xFF)
+                     slot (long (loop [s (bit-and hv cap-mask)]
+                                  (let [sv (aget slots s)]
+                                    (cond
+                                      (== sv -1) s
+                                      (and (== (bit-and (bit-shift-right sv 24) 0xFF) salt)
+                                           (keys-equal? kcols nkeys row
+                                                        (aget rep (bit-and sv 0xFFFFFF)))) s
+                                      :else (recur (bit-and (unchecked-inc s) cap-mask))))))
+                     sv (aget slots slot)]
+                 (if (== sv -1)
+                   (do (aset slots slot (unchecked-int (bit-or (bit-shift-left salt 24) gid)))
+                       (aset rep gid (int row))
+                       (aset row-groups row (int gid))
+                       (recur (unchecked-inc row) (unchecked-inc gid)))
+                   (do (aset row-groups row (int (bit-and sv 0xFFFFFF)))
+                       (recur (unchecked-inc row) gid))))
+               gid)))]
+      [n-groups row-groups])))
+
+(defn- build-groups-wide
+  "Fallback build for tables too large for 24-bit group ids. Stores the
+   full hash and representative row per slot; matched on hash, verified
+   by comparing actual key values."
   [key-cols ^longs hashes]
   (let [nrows  (long (col/-len (first key-cols)))
         nkeys  (long (count key-cols))
@@ -190,6 +275,14 @@
                        (recur (unchecked-inc row) gid))))
                gid)))]
       [n-groups row-groups])))
+
+(defn- build-groups-hashed
+  "Assign each row a group-id via an open-addressing hash table.
+   Returns [n-groups row-groups]."
+  [key-cols ^longs hashes]
+  (if (< (long (col/-len (first key-cols))) 0xFFFFFE)
+    (build-groups-salt key-cols hashes)
+    (build-groups-wide key-cols hashes)))
 
 (defn build-groups
   "Assign each row a group-id. Returns [n-groups row-groups]."
@@ -590,6 +683,91 @@
       (throw (IllegalArgumentException. (str "Unsupported key type: " tag))))))
 
 ;; ════════════════════════════════════════════════════════════════════════
+;; Row gathering — selection vectors and partition-local materialization
+;; ════════════════════════════════════════════════════════════════════════
+
+(defn- gather-column
+  "Materialize the rows sel[start..start+n-local) of column c into a fresh
+   column. Used for partition-local data and fused-filter selections."
+  [c ^ints sel ^long start ^long n-local]
+  (case (col/-type-tag c)
+    :i64 (let [^I64Column ic c
+               ^longs data (.data ic)
+               off (.offset ic)
+               out (long-array n-local)]
+           (loop [i (int 0)]
+             (when (< i n-local)
+               (aset out i (aget data (+ off (aget sel (+ start i)))))
+               (recur (unchecked-inc i))))
+           (I64Column. out n-local 0 (.has-nulls ic)))
+    :f64 (let [^F64Column fc c
+               ^doubles data (.data fc)
+               off (.offset fc)
+               out (double-array n-local)]
+           (loop [i (int 0)]
+             (when (< i n-local)
+               (aset out i (aget data (+ off (aget sel (+ start i)))))
+               (recur (unchecked-inc i))))
+           (F64Column. out n-local 0 (.has-nulls fc)))
+    :bool (let [^BoolColumn bc c
+                ^bytes data (.data bc)
+                off (.offset bc)
+                out (byte-array n-local)]
+            (loop [i (int 0)]
+              (when (< i n-local)
+                (aset out i (aget data (+ off (aget sel (+ start i)))))
+                (recur (unchecked-inc i))))
+            (BoolColumn. out n-local 0))
+    (:sym :str)
+    (let [^objects data (obj-data c)
+          off (obj-offset c)
+          out (object-array n-local)]
+      (loop [i (int 0)]
+        (when (< i n-local)
+          (aset out i (aget data (+ off (aget sel (+ start i)))))
+          (recur (unchecked-inc i))))
+      (if (= :sym (col/-type-tag c))
+        (SymColumn. out n-local 0 (col/-has-nulls? c))
+        (StrColumn. out n-local 0 (col/-has-nulls? c))))
+    (throw (IllegalArgumentException.
+            (str "Unsupported column type: " (col/-type-tag c))))))
+
+(defn- mask->selection
+  "Indices of rows where the BoolColumn mask is 1, as an int array."
+  ^ints [mask]
+  (let [^BoolColumn m mask
+        ^bytes d (.data m)
+        off (.offset m)
+        n (.len m)
+        k (loop [i (int 0), c (int 0)]
+            (if (< i n)
+              (recur (unchecked-inc i)
+                     (if (== 1 (aget d (+ off i))) (unchecked-inc c) c))
+              c))
+        sel (int-array k)]
+    (loop [i (int 0), j (int 0)]
+      (when (< i n)
+        (if (== 1 (aget d (+ off i)))
+          (do (aset sel j i)
+              (recur (unchecked-inc i) (unchecked-inc j)))
+          (recur (unchecked-inc i) j))))
+    sel))
+
+(defn- apply-where
+  "Gather key and value columns through a filter mask (fused filter+group:
+   only the columns the group-by touches are materialized, never the whole
+   table). Returns [key-cols val-cols]."
+  [key-cols val-cols where nrows]
+  (if (nil? where)
+    [key-cols val-cols]
+    (do (assert (= (long nrows) (long (col/-len where)))
+                "Filter mask length must match table row count")
+        (let [sel (mask->selection where)
+              n-sel (alength sel)]
+          [(mapv #(gather-column % sel 0 n-sel) key-cols)
+           (mapv #(gather-column % sel 0 n-sel) val-cols)]))))
+
+;; ════════════════════════════════════════════════════════════════════════
 ;; Public API
 ;; ════════════════════════════════════════════════════════════════════════
 
@@ -603,23 +781,29 @@
 
    Returns a new Table with key columns followed by aggregation result columns.
 
-   Supported agg types: :sum, :count, :min, :max, :avg"
-  [table & {:keys [keys aggs]}]
-  (let [key-cols (mapv #(tbl/col table %) keys)
-        _ (assert (seq key-cols) "At least one key column required")
-        nrows (col/-len (first key-cols))
-        _ (doseq [kc (rest key-cols)]
+   Supported agg types: :sum, :count, :min, :max, :avg
+
+   Options:
+     :where — a BoolColumn mask (e.g. from flatiron.filter/scalar-pred);
+              rows where the mask is 0 are excluded without materializing
+              a filtered table."
+  [table & {:keys [keys aggs where]}]
+  (let [key-cols0 (mapv #(tbl/col table %) keys)
+        _ (assert (seq key-cols0) "At least one key column required")
+        nrows (col/-len (first key-cols0))
+        _ (doseq [kc (rest key-cols0)]
             (assert (= nrows (col/-len kc)) "All key columns must have same length"))
-        [n-groups groups] (build-groups key-cols)
-        n-groups (long n-groups)
-        ^ints row-groups groups]
-    (if (zero? n-groups)
+        val-cols0 (mapv #(tbl/col table (:col %)) aggs)
+        [key-cols val-cols] (apply-where key-cols0 val-cols0 where nrows)]
+    (if (zero? (long (col/-len (first key-cols))))
       (tbl/table [] [])
-      (let [result-keys (mapv #(compress-key-column % row-groups n-groups) key-cols)
-            agg-cols    (mapv (fn [{:keys [agg col]}]
-                                (make-agg-column (tbl/col table col) agg
-                                                 row-groups n-groups))
-                              aggs)]
+      (let [[n-groups groups] (build-groups key-cols)
+            n-groups (long n-groups)
+            ^ints row-groups groups
+            result-keys (mapv #(compress-key-column % row-groups n-groups) key-cols)
+            agg-cols    (mapv (fn [val-col {:keys [agg]}]
+                                (make-agg-column val-col agg row-groups n-groups))
+                              val-cols aggs)]
         (tbl/table (vec (concat keys (mapv :out aggs)))
                    (vec (concat result-keys agg-cols)))))))
 
@@ -637,52 +821,6 @@
       (if (>= (bit-shift-left 1 bits) target)
         (min bits 10)
         (recur (unchecked-inc bits))))))
-
-(defn- gather-column
-  "Materialize the rows part-rows[start..start+n-local) of column c into a
-   fresh column. Gives partition workers contiguous, type-specialized data."
-  [c ^ints part-rows ^long start ^long n-local]
-  (case (col/-type-tag c)
-    :i64 (let [^I64Column ic c
-               ^longs data (.data ic)
-               off (.offset ic)
-               out (long-array n-local)]
-           (loop [i (int 0)]
-             (when (< i n-local)
-               (aset out i (aget data (+ off (aget part-rows (+ start i)))))
-               (recur (unchecked-inc i))))
-           (I64Column. out n-local 0 (.has-nulls ic)))
-    :f64 (let [^F64Column fc c
-               ^doubles data (.data fc)
-               off (.offset fc)
-               out (double-array n-local)]
-           (loop [i (int 0)]
-             (when (< i n-local)
-               (aset out i (aget data (+ off (aget part-rows (+ start i)))))
-               (recur (unchecked-inc i))))
-           (F64Column. out n-local 0 (.has-nulls fc)))
-    :bool (let [^BoolColumn bc c
-                ^bytes data (.data bc)
-                off (.offset bc)
-                out (byte-array n-local)]
-            (loop [i (int 0)]
-              (when (< i n-local)
-                (aset out i (aget data (+ off (aget part-rows (+ start i)))))
-                (recur (unchecked-inc i))))
-            (BoolColumn. out n-local 0))
-    (:sym :str)
-    (let [^objects data (obj-data c)
-          off (obj-offset c)
-          out (object-array n-local)]
-      (loop [i (int 0)]
-        (when (< i n-local)
-          (aset out i (aget data (+ off (aget part-rows (+ start i)))))
-          (recur (unchecked-inc i))))
-      (if (= :sym (col/-type-tag c))
-        (SymColumn. out n-local 0 (col/-has-nulls? c))
-        (StrColumn. out n-local 0 (col/-has-nulls? c))))
-    (throw (IllegalArgumentException.
-            (str "Unsupported column type: " (col/-type-tag c))))))
 
 (defn- partition-local-group-by
   "Group one radix partition: rows part-rows[start..end) with matching
@@ -738,86 +876,108 @@
 
 (defn parallel-group-by
   "Parallel radix-partitioned group-by.
-   Partitions rows by the high radix bits of the combined key hash (disjoint
-   from the low bits used for hash-table slots), then processes each
-   partition independently in core.async threads. Results are concatenated —
+   Hash, histogram and scatter phases run chunk-parallel on a shared
+   ForkJoin pool; rows are partitioned by the high radix bits of the
+   combined key hash (disjoint from the low bits used for hash-table
+   slots and the mid bits used for slot salts), and each partition is
+   grouped independently. Results are concatenated in partition order —
    no merging needed since partitions are disjoint.
 
-   Usage: (parallel-group-by table :keys [:region] :aggs [{:agg :sum :col :amount :out :total}])
-
    Options:
-     :n-threads — number of worker threads (default 4)"
-  [table & {:keys [keys aggs n-threads]
+     :n-threads — phase chunking / partition count hint (default 4)
+     :where     — BoolColumn mask, as in group-by"
+  [table & {:keys [keys aggs n-threads where]
             :or {n-threads DEFAULT-PARALLELISM}}]
-  (let [key-cols (mapv #(tbl/col table %) keys)
-        _ (assert (seq key-cols) "At least one key column required")
-        nrows (long (col/-len (first key-cols)))
-        _ (doseq [kc (rest key-cols)]
-            (assert (= nrows (col/-len kc)) "All key columns must have same length"))
+  (let [key-cols0 (mapv #(tbl/col table %) keys)
+        _ (assert (seq key-cols0) "At least one key column required")
+        nrows0 (long (col/-len (first key-cols0)))
+        _ (doseq [kc (rest key-cols0)]
+            (assert (= nrows0 (col/-len kc)) "All key columns must have same length"))
         schema (vec (concat keys (mapv :out aggs)))
-        val-cols (mapv #(tbl/col table (:col %)) aggs)]
+        val-cols0 (mapv #(tbl/col table (:col %)) aggs)
+        [key-cols val-cols] (apply-where key-cols0 val-cols0 where nrows0)
+        nrows (long (col/-len (first key-cols)))]
     (if (zero? nrows)
       (tbl/table [] [])
-      (let [rbits   (radix-bits n-threads)
+      (let [n-threads (long n-threads)
+            rbits   (radix-bits n-threads)
             n-parts (int (bit-shift-left 1 rbits))
             shift   (- 64 rbits)
-            hashes  (combined-hashes key-cols)
-            ;; histogram → prefix sum → scatter (no per-row allocation)
-            counts  (int-array n-parts)
-            _ (loop [i (int 0)]
-                (when (< i nrows)
-                  (let [p (unsigned-bit-shift-right (aget hashes i) shift)]
-                    (aset counts p (unchecked-inc (aget counts p))))
-                  (recur (unchecked-inc i))))
+            hashes  (long-array nrows)
+            ranges  (chunk-ranges nrows (max 1 (min n-threads (quot nrows 8192))))
+            n-chunks (count ranges)
+            ;; Phase A (parallel): combined hash + per-chunk partition histogram
+            hists (invoke-tasks
+                   (mapv (fn [[s e]]
+                           (fn []
+                             (let [s (long s) e (long e)
+                                   hist (int-array n-parts)]
+                               (combined-hashes-range! key-cols hashes s e)
+                               (loop [i s]
+                                 (when (< i e)
+                                   (let [p (unsigned-bit-shift-right (aget hashes i) shift)]
+                                     (aset hist p (unchecked-inc (aget hist p))))
+                                   (recur (unchecked-inc i))))
+                               hist)))
+                         ranges))
+            ;; prefix sums: global partition offsets + per-(chunk, partition) cursors
             offsets (int-array (inc n-parts))
+            cursors (object-array n-chunks)
+            _ (dotimes [t n-chunks] (aset cursors t (int-array n-parts)))
             _ (loop [p (int 0), acc (int 0)]
                 (when (< p n-parts)
-                  (aset offsets (unchecked-inc p) (unchecked-add-int acc (aget counts p)))
-                  (recur (unchecked-inc p) (unchecked-add-int acc (aget counts p)))))
+                  (let [acc' (long (loop [t 0, a (long acc)]
+                                     (if (< t n-chunks)
+                                       (let [^ints hist (nth hists t)
+                                             ^ints cur (aget cursors t)]
+                                         (aset cur p (int a))
+                                         (recur (unchecked-inc t) (+ a (aget hist p))))
+                                       a)))]
+                    (aset offsets (unchecked-inc p) (int acc'))
+                    (recur (unchecked-inc p) (int acc')))))
             part-rows   (int-array nrows)
             part-hashes (long-array nrows)
-            cursor (java.util.Arrays/copyOf offsets n-parts)
-            _ (loop [i (int 0)]
-                (when (< i nrows)
-                  (let [hv (aget hashes i)
-                        p (unsigned-bit-shift-right hv shift)
-                        idx (aget cursor p)]
-                    (aset part-rows idx i)
-                    (aset part-hashes idx hv)
-                    (aset cursor p (unchecked-inc idx)))
-                  (recur (unchecked-inc i))))
-            result-chan (a/chan n-parts)
-            active (loop [p 0, n 0]
-                     (if (< p n-parts)
-                       (recur (inc p)
-                              (if (> (aget offsets (inc p)) (aget offsets p)) (inc n) n))
-                       n))]
-        (dotimes [p n-parts]
-          (let [start (aget offsets p)
-                end (aget offsets (inc p))]
-            (when (> end start)
-              (a/thread
-                (a/>!! result-chan
-                       (try
-                         (partition-local-group-by key-cols val-cols aggs
-                                                   part-rows part-hashes start end)
-                         (catch Throwable t t)))))))
-        (loop [remaining (long active)
-               acc-cols nil]
-          (if (zero? remaining)
-            (if acc-cols
-              (tbl/table schema acc-cols)
-              (tbl/table schema
-                         (vec (repeat (count schema)
-                                      (I64Column. (long-array 0) 0 0 false)))))
-            (let [result (a/<!! result-chan)]
-              (cond
-                (instance? Throwable result) (throw result)
-                (nil? result) (recur (dec remaining) acc-cols)
-                :else (recur (dec remaining)
-                             (if (nil? acc-cols)
-                               result
-                               (mapv concat-columns acc-cols result)))))))))))
+            ;; Phase B (parallel): scatter rows into partition-contiguous arrays.
+            ;; Chunks write through their own cursor rows, so partition segments
+            ;; stay in global row order and results are deterministic.
+            _ (invoke-tasks
+               (mapv (fn [[s e] t]
+                       (fn []
+                         (let [s (long s) e (long e)
+                               ^ints cur (aget cursors t)]
+                           (loop [i s]
+                             (when (< i e)
+                               (let [hv (aget hashes i)
+                                     p (unsigned-bit-shift-right hv shift)
+                                     idx (aget cur p)]
+                                 (aset part-rows idx (int i))
+                                 (aset part-hashes idx hv)
+                                 (aset cur p (unchecked-inc idx)))
+                               (recur (unchecked-inc i)))))
+                         nil))
+                     ranges (range)))
+            ;; Phase C (parallel): group each non-empty partition independently
+            part-results
+            (invoke-tasks
+             (into []
+                   (keep (fn [p]
+                           (let [start (aget offsets p)
+                                 end (aget offsets (inc (long p)))]
+                             (when (> end start)
+                               (fn []
+                                 (partition-local-group-by key-cols val-cols aggs
+                                                           part-rows part-hashes
+                                                           start end))))))
+                   (range n-parts)))
+            cols-list (filterv some? part-results)]
+        (if (empty? cols-list)
+          (tbl/table schema
+                     (vec (repeat (count schema)
+                                  (I64Column. (long-array 0) 0 0 false))))
+          (tbl/table schema
+                     (reduce (fn [acc cols] (mapv concat-columns acc cols))
+                             (first cols-list)
+                             (rest cols-list))))))))
 
 ;; ════════════════════════════════════════════════════════════════════════
 ;; Pivot (cross-tabulation)
