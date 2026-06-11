@@ -207,7 +207,7 @@ There are several good Clojure data libraries. Flatiron fills a specific niche:
 
 - **vs `tech.ml.dataset`** — TMD is more feature-rich (date handling, statistical functions, interop with many formats). Flatiron is smaller, has no native dependencies, and focuses on raw speed for a narrower set of operations.
 
-- **vs embedded databases (H2, SQLite)** — Databases give you SQL, transactions, and persistence. Flatiron gives you in-process data you can manipulate directly from Clojure without going through JDBC. If you already have data in Clojure data structures and just need fast analytics, Flatiron is less ceremony.
+- **vs embedded databases (H2, SQLite)** — Databases give you SQL, transactions, and persistence. Flatiron gives you in-process data you can manipulate directly from Clojure without going through JDBC. If you already have data in Clojure data structures and just need fast analytics, Flatiron is less ceremony. It's also a graph engine: build a CSR graph from two columns and run BFS, Dijkstra, PageRank, or connected components on the same data you're aggregating — in a SQL database that means recursive CTEs at best, or exporting to a separate graph library.
 
 ## Benchmarks vs Rayforce (C)
 
