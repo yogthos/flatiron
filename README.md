@@ -16,10 +16,11 @@ The morsel engine processes data in 1024-row batches. This amortizes the cost of
 
 ## Installation
 
-Flatiron has no published artifact yet. For now, add the git dependency to your `deps.edn`:
+Add the git dependency to your `deps.edn`:
 
 ```clojure
-{io.github.yogthos/flatiron {:git/sha "..."}}
+{io.github.yogthos/flatiron {:git/tag "v0.1.0"
+                             :git/sha "838c4a4b8d68378cf51897ba03ed93e1ff0b9921"}}
 ```
 
 It depends on Clojure 1.12.0 and core.async 1.6.681.
