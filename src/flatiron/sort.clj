@@ -134,7 +134,7 @@
             dst (long-array n)]
         (dotimes [i n]
           (aset dst i (aget src (+ offset (aget idx i)))))
-        (I64Column. dst n 0 (.has-nulls c)))
+        (col/i64-like c dst n))
       :f64
       (let [^flatiron.column.F64Column c col
             ^doubles src (.data c)
@@ -142,7 +142,7 @@
             dst (double-array n)]
         (dotimes [i n]
           (aset dst i (aget src (+ offset (aget idx i)))))
-        (F64Column. dst n 0 (.has-nulls c)))
+        (col/f64-like c dst n))
       :sym
       (let [^flatiron.column.SymColumn c col
             ^objects src (.data c)

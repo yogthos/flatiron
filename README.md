@@ -55,6 +55,46 @@ A **Table** is a schema (vector of keyword column names) plus a vector of column
   (tbl/col table :Gold))  ;; => #<I64Column ...> — Smaug is hoarding again
 ```
 
+### Custom types
+
+Domain types like dates and timestamps don't need their own column type or an `Object[]` that boxes every value. A `LocalDate` is just its epoch day, an `Instant` is just its epoch milli, and those encodings preserve order, so comparison, sorting, group-by, and min/max are all already correct on the underlying primitive. Flatiron stores such a type as a normal `long[]` column tagged with a *logical type*: the column reports its physical type (`:i64`) to every operation, so the hot loops are unchanged and the values are never boxed, and only the boundaries (building a column, reading a value back, persisting) run the codec that converts to and from the domain object.
+
+```clojure
+(require '[flatiron.column :as col])
+
+(let [hired (col/date-column [(java.time.LocalDate/of 2019 4 1)
+                              (java.time.LocalDate/of 2021 9 15)])]
+  (col/-type-tag hired)        ;; => :i64   (physical — what operations dispatch on)
+  (col/-logical-tag hired)     ;; => :date  (logical — how values are exposed)
+  (col/-get-obj hired 0))      ;; => #object[java.time.LocalDate "2019-04-01"]
+```
+
+Built-in logical types, all backed by `long[]`: `:date` (`LocalDate`), `:instant` (`Instant`), `:datetime` (`LocalDateTime`), `:date-millis` (`java.util.Date`), and `:duration` (`Duration`). Build a column for any of them with `col/typed-column` or the `date-column`/`instant-column`/`datetime-column`/`duration-column` helpers.
+
+Predicates take the domain value directly. The literal is encoded once per predicate, outside the row loop, so the comparison stays a primitive operation:
+
+```clojure
+(-> employees
+    (where (>= :Hired (java.time.LocalDate/of 2020 1 1)))
+    (select :Dept (count :Hired)))
+```
+
+Operations that preserve a value keep the logical type: filtering, sorting, group-by keys, and `min`/`max` of a date column all return dates. Aggregations that produce a new number drop it, so `sum` and `avg` over a date column come back as plain `:i64`/`:f64`. The binary store records the logical type in its metadata, so saved tables round-trip with their types intact.
+
+Register your own type with `flatiron.types/register-type!`, giving it a physical backing (`:i64` or `:f64`) and an encode/decode pair:
+
+```clojure
+(require '[flatiron.types :as types])
+
+(types/register-type! :cents
+  {:physical :i64
+   :class    java.math.BigDecimal
+   :encode   (fn ^long [^java.math.BigDecimal d] (.longValueExact (.movePointRight d 2)))
+   :decode   (fn [^long v] (.movePointLeft (java.math.BigDecimal/valueOf v) 2))})
+
+(col/typed-column :cents [(bigdec "1.50") (bigdec "2.25")])
+```
+
 ### Filtering
 
 The `where` macro builds a boolean mask by comparing a column against a constant, combines masks for compound predicates with `and`, `or`, and `not`, then materializes the rows that pass into a new table. A three-level selection bitmap lives in `flatiron.selection` as a lower-level primitive for callers that want to track which rows are alive without materializing, but the built-in `where` materializes eagerly.

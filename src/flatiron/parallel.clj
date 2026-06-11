@@ -239,7 +239,7 @@
          (let [[start local cnt] (a/<!! result-chan)]
            (System/arraycopy local 0 out start cnt)
            (recur (dec remaining)))))
-     (I64Column. out n 0 has-nulls))))
+     (I64Column. out n 0 has-nulls nil))))
 
 ;; ════════════════════════════════════════════════════════════════════════
 ;; Parallel group-by
@@ -265,6 +265,26 @@
       (dotimes [g n-groups] (aset out g (unchecked-add (aget out g) (aget p g)))))
     out))
 
+;; min/max over a nullable column leave groups with no non-null value at the
+;; fill sentinel. Match group/make-agg-column: rewrite those to the null
+;; sentinel and report whether any were unseen, so the result decodes as nil
+;; (and a logically-typed column never decodes a bogus sentinel).
+(defn- null-out-unseen-i64! [^longs out ^booleans seen ^long n-groups]
+  (loop [g 0, any false]
+    (if (< g n-groups)
+      (if (aget seen g)
+        (recur (unchecked-inc g) any)
+        (do (aset out g col/NULL_I64) (recur (unchecked-inc g) true)))
+      any)))
+
+(defn- null-out-unseen-f64! [^doubles out ^booleans seen ^long n-groups]
+  (loop [g 0, any false]
+    (if (< g n-groups)
+      (if (aget seen g)
+        (recur (unchecked-inc g) any)
+        (do (aset out g Double/NaN) (recur (unchecked-inc g) true)))
+      any)))
+
 (defn- par-group-agg
   "Compute one aggregation column for a parallel group-by. `row-groups` maps
    each row to its group id; the accumulation is split across `ranges`, each
@@ -273,7 +293,9 @@
   [val-col agg n-groups ^ints row-groups ranges]
   (let [n-groups (long n-groups)
         tag   (col/-type-tag val-col)
-        has-n (col/-has-nulls? val-col)]
+        has-n (col/-has-nulls? val-col)
+        ;; min/max keep a logical type; sum/count/avg collapse to plain numbers.
+        lg    (col/-logical-tag val-col)]
     (case tag
       :i64
       (case agg
@@ -289,7 +311,7 @@
                                              (aset loc g (unchecked-add (aget loc g) v)))))
                                        (recur (unchecked-inc i))))
                                    loc))))
-                           n-groups 0 false)
+                           n-groups 0 false nil)
         :count (I64Column. (merge-long-sum n-groups
                              (par-collect ranges
                                (fn [s e]
@@ -302,39 +324,53 @@
                                              (aset loc g (unchecked-inc (aget loc g))))))
                                        (recur (unchecked-inc i))))
                                    loc))))
-                           n-groups 0 false)
+                           n-groups 0 false nil)
         :min   (let [parts (par-collect ranges
                              (fn [s e]
-                               (let [loc (long-array n-groups)]
+                               (let [loc (long-array n-groups)
+                                     seen (when has-n (boolean-array n-groups))]
                                  (java.util.Arrays/fill loc Long/MAX_VALUE)
                                  (loop [i s]
                                    (when (< i e)
                                      (let [v (long (col/-get-long val-col i))]
                                        (when (or (not has-n) (not= v col/NULL_I64))
                                          (let [g (aget row-groups i)]
-                                           (aset loc g (min (aget loc g) v)))))
+                                           (aset loc g (min (aget loc g) v))
+                                           (when seen (aset ^booleans seen g true)))))
                                      (recur (unchecked-inc i))))
-                                 loc)))
-                     out (long-array n-groups)]
+                                 [loc seen])))
+                     out (long-array n-groups)
+                     seen (when has-n (boolean-array n-groups))]
                  (java.util.Arrays/fill out Long/MAX_VALUE)
-                 (doseq [^longs p parts] (dotimes [g n-groups] (aset out g (min (aget out g) (aget p g)))))
-                 (I64Column. out n-groups 0 false))
+                 (doseq [[^longs p ^booleans ps] parts]
+                   (dotimes [g n-groups]
+                     (aset out g (min (aget out g) (aget p g)))
+                     (when (and seen (aget ps g)) (aset ^booleans seen g true))))
+                 (I64Column. out n-groups 0
+                             (boolean (and seen (null-out-unseen-i64! out seen n-groups))) lg))
         :max   (let [parts (par-collect ranges
                              (fn [s e]
-                               (let [loc (long-array n-groups)]
+                               (let [loc (long-array n-groups)
+                                     seen (when has-n (boolean-array n-groups))]
                                  (java.util.Arrays/fill loc Long/MIN_VALUE)
                                  (loop [i s]
                                    (when (< i e)
                                      (let [v (long (col/-get-long val-col i))]
                                        (when (or (not has-n) (not= v col/NULL_I64))
                                          (let [g (aget row-groups i)]
-                                           (aset loc g (max (aget loc g) v)))))
+                                           (aset loc g (max (aget loc g) v))
+                                           (when seen (aset ^booleans seen g true)))))
                                      (recur (unchecked-inc i))))
-                                 loc)))
-                     out (long-array n-groups)]
+                                 [loc seen])))
+                     out (long-array n-groups)
+                     seen (when has-n (boolean-array n-groups))]
                  (java.util.Arrays/fill out Long/MIN_VALUE)
-                 (doseq [^longs p parts] (dotimes [g n-groups] (aset out g (max (aget out g) (aget p g)))))
-                 (I64Column. out n-groups 0 false))
+                 (doseq [[^longs p ^booleans ps] parts]
+                   (dotimes [g n-groups]
+                     (aset out g (max (aget out g) (aget p g)))
+                     (when (and seen (aget ps g)) (aset ^booleans seen g true))))
+                 (I64Column. out n-groups 0
+                             (boolean (and seen (null-out-unseen-i64! out seen n-groups))) lg))
         :avg   (let [parts (par-collect ranges
                              (fn [s e]
                                (let [sums (long-array n-groups)
@@ -355,7 +391,7 @@
                    (aset out g (if (zero? (aget cnt g))
                                  Double/NaN
                                  (/ (double (aget sum g)) (double (aget cnt g))))))
-                 (F64Column. out n-groups 0 false))
+                 (F64Column. out n-groups 0 false nil))
         (throw (IllegalArgumentException. (str "Unknown agg: " agg))))
       :f64
       (case agg
@@ -372,7 +408,7 @@
                                  loc)))
                      out (double-array n-groups)]
                  (doseq [^doubles p parts] (dotimes [g n-groups] (aset out g (+ (aget out g) (aget p g)))))
-                 (F64Column. out n-groups 0 false))
+                 (F64Column. out n-groups 0 false nil))
         :count (I64Column. (merge-long-sum n-groups
                              (par-collect ranges
                                (fn [s e]
@@ -385,39 +421,53 @@
                                              (aset loc g (unchecked-inc (aget loc g))))))
                                        (recur (unchecked-inc i))))
                                    loc))))
-                           n-groups 0 false)
+                           n-groups 0 false nil)
         :min   (let [parts (par-collect ranges
                              (fn [s e]
-                               (let [loc (double-array n-groups)]
+                               (let [loc (double-array n-groups)
+                                     seen (when has-n (boolean-array n-groups))]
                                  (java.util.Arrays/fill loc Double/MAX_VALUE)
                                  (loop [i s]
                                    (when (< i e)
                                      (let [v (double (col/-get-double val-col i))]
                                        (when-not (Double/isNaN v)
                                          (let [g (aget row-groups i)]
-                                           (aset loc g (min (aget loc g) v)))))
+                                           (aset loc g (min (aget loc g) v))
+                                           (when seen (aset ^booleans seen g true)))))
                                      (recur (unchecked-inc i))))
-                                 loc)))
-                     out (double-array n-groups)]
+                                 [loc seen])))
+                     out (double-array n-groups)
+                     seen (when has-n (boolean-array n-groups))]
                  (java.util.Arrays/fill out Double/MAX_VALUE)
-                 (doseq [^doubles p parts] (dotimes [g n-groups] (aset out g (min (aget out g) (aget p g)))))
-                 (F64Column. out n-groups 0 false))
+                 (doseq [[^doubles p ^booleans ps] parts]
+                   (dotimes [g n-groups]
+                     (aset out g (min (aget out g) (aget p g)))
+                     (when (and seen (aget ps g)) (aset ^booleans seen g true))))
+                 (F64Column. out n-groups 0
+                             (boolean (and seen (null-out-unseen-f64! out seen n-groups))) lg))
         :max   (let [parts (par-collect ranges
                              (fn [s e]
-                               (let [loc (double-array n-groups)]
+                               (let [loc (double-array n-groups)
+                                     seen (when has-n (boolean-array n-groups))]
                                  (java.util.Arrays/fill loc (- Double/MAX_VALUE))
                                  (loop [i s]
                                    (when (< i e)
                                      (let [v (double (col/-get-double val-col i))]
                                        (when-not (Double/isNaN v)
                                          (let [g (aget row-groups i)]
-                                           (aset loc g (max (aget loc g) v)))))
+                                           (aset loc g (max (aget loc g) v))
+                                           (when seen (aset ^booleans seen g true)))))
                                      (recur (unchecked-inc i))))
-                                 loc)))
-                     out (double-array n-groups)]
+                                 [loc seen])))
+                     out (double-array n-groups)
+                     seen (when has-n (boolean-array n-groups))]
                  (java.util.Arrays/fill out (- Double/MAX_VALUE))
-                 (doseq [^doubles p parts] (dotimes [g n-groups] (aset out g (max (aget out g) (aget p g)))))
-                 (F64Column. out n-groups 0 false))
+                 (doseq [[^doubles p ^booleans ps] parts]
+                   (dotimes [g n-groups]
+                     (aset out g (max (aget out g) (aget p g)))
+                     (when (and seen (aget ps g)) (aset ^booleans seen g true))))
+                 (F64Column. out n-groups 0
+                             (boolean (and seen (null-out-unseen-f64! out seen n-groups))) lg))
         :avg   (let [parts (par-collect ranges
                              (fn [s e]
                                (let [sums (double-array n-groups)
@@ -439,7 +489,7 @@
                    (aset out g (if (zero? (aget cnt g))
                                  Double/NaN
                                  (/ (aget sum g) (double (aget cnt g))))))
-                 (F64Column. out n-groups 0 false))
+                 (F64Column. out n-groups 0 false nil))
         (throw (IllegalArgumentException. (str "Unknown agg: " agg))))
       (:sym :str :bool)
       (case agg
@@ -455,7 +505,7 @@
                                              (aset loc g (unchecked-inc (aget loc g))))))
                                        (recur (unchecked-inc i))))
                                    loc))))
-                           n-groups 0 false)
+                           n-groups 0 false nil)
         (throw (IllegalArgumentException. (str "Agg " agg " not supported for " tag " values"))))
       (throw (IllegalArgumentException. (str "Unsupported value type for agg: " tag))))))
 

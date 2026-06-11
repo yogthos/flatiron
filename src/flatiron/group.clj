@@ -546,7 +546,10 @@
    group assignment. Min/max/avg of a group with no non-null values is null."
   [val-col agg ^ints row-groups ^long n-groups]
   (let [tag (col/-type-tag val-col)
-        has-nulls (boolean (col/-has-nulls? val-col))]
+        has-nulls (boolean (col/-has-nulls? val-col))
+        ;; min/max of a logically-typed column stay that type; sum/count/avg
+        ;; collapse to plain numbers, so they pass nil below.
+        lg  (col/-logical-tag val-col)]
     (case tag
       (:sym :str :bool)
       (case agg
@@ -555,29 +558,29 @@
                    ;; BoolColumn is non-nullable: count = group size
                    (count-rows! row-groups cnt (col/-len val-col))
                    (accumulate-obj-count! val-col row-groups cnt))
-                 (I64Column. cnt n-groups 0 false))
+                 (I64Column. cnt n-groups 0 false nil))
         (throw (IllegalArgumentException.
                 (str "Agg " agg " not supported for " tag " values"))))
       :i64
       (case agg
         :sum   (let [s (long-array n-groups)]
                  (accumulate-i64-sum! val-col row-groups s)
-                 (I64Column. s n-groups 0 false))
+                 (I64Column. s n-groups 0 false nil))
         :count (let [c (long-array n-groups)]
                  (accumulate-i64-count! val-col row-groups c)
-                 (I64Column. c n-groups 0 false))
+                 (I64Column. c n-groups 0 false nil))
         :min   (let [m (long-array n-groups)
                      seen (when has-nulls (boolean-array n-groups))]
                  (java.util.Arrays/fill m Long/MAX_VALUE)
                  (accumulate-i64-min! val-col row-groups m seen)
                  (I64Column. m n-groups 0
-                             (boolean (and seen (fill-unseen-i64! m seen n-groups)))))
+                             (boolean (and seen (fill-unseen-i64! m seen n-groups))) lg))
         :max   (let [m (long-array n-groups)
                      seen (when has-nulls (boolean-array n-groups))]
                  (java.util.Arrays/fill m Long/MIN_VALUE)
                  (accumulate-i64-max! val-col row-groups m seen)
                  (I64Column. m n-groups 0
-                             (boolean (and seen (fill-unseen-i64! m seen n-groups)))))
+                             (boolean (and seen (fill-unseen-i64! m seen n-groups))) lg))
         :avg   (let [s (long-array n-groups)
                      c (long-array n-groups)]
                  (accumulate-i64-avg! val-col row-groups s c)
@@ -591,27 +594,27 @@
                                         (do (aset out i (/ (double (aget s i)) (double cnt)))
                                             (recur (unchecked-inc i) any))))
                                     any))]
-                   (F64Column. out n-groups 0 (boolean any-null)))))
+                   (F64Column. out n-groups 0 (boolean any-null) nil))))
       :f64
       (case agg
         :sum   (let [s (double-array n-groups)]
                  (accumulate-f64-sum! val-col row-groups s)
-                 (F64Column. s n-groups 0 false))
+                 (F64Column. s n-groups 0 false nil))
         :count (let [c (long-array n-groups)]
                  (accumulate-f64-count! val-col row-groups c)
-                 (I64Column. c n-groups 0 false))
+                 (I64Column. c n-groups 0 false nil))
         :min   (let [m (double-array n-groups)
                      seen (when has-nulls (boolean-array n-groups))]
                  (java.util.Arrays/fill m Double/POSITIVE_INFINITY)
                  (accumulate-f64-min! val-col row-groups m seen)
                  (F64Column. m n-groups 0
-                             (boolean (and seen (fill-unseen-f64! m seen n-groups)))))
+                             (boolean (and seen (fill-unseen-f64! m seen n-groups))) lg))
         :max   (let [m (double-array n-groups)
                      seen (when has-nulls (boolean-array n-groups))]
                  (java.util.Arrays/fill m Double/NEGATIVE_INFINITY)
                  (accumulate-f64-max! val-col row-groups m seen)
                  (F64Column. m n-groups 0
-                             (boolean (and seen (fill-unseen-f64! m seen n-groups)))))
+                             (boolean (and seen (fill-unseen-f64! m seen n-groups))) lg))
         :avg   (let [s (double-array n-groups)
                      c (long-array n-groups)]
                  (accumulate-f64-avg! val-col row-groups s c)
@@ -625,7 +628,7 @@
                                         (do (aset out i (/ (aget s i) (double cnt)))
                                             (recur (unchecked-inc i) any))))
                                     any))]
-                   (F64Column. out n-groups 0 (boolean any-null)))))
+                   (F64Column. out n-groups 0 (boolean any-null) nil))))
       (throw (IllegalArgumentException.
               (str "Unsupported value type for agg: " tag))))))
 
@@ -652,7 +655,7 @@
                 (aset seen g true)
                 (aset out g (aget data (+ off row)))))
             (recur (unchecked-inc row))))
-        (I64Column. out n-groups 0 (.has-nulls c)))
+        (col/i64-like c out n-groups))
       :f64
       (let [^F64Column c key-col
             ^doubles data (.data c)
@@ -665,7 +668,7 @@
                 (aset seen g true)
                 (aset out g (aget data (+ off row)))))
             (recur (unchecked-inc row))))
-        (F64Column. out n-groups 0 (.has-nulls c)))
+        (col/f64-like c out n-groups))
       (:sym :str)
       (let [^objects data (obj-data key-col)
             off (obj-offset key-col)
@@ -699,7 +702,7 @@
              (when (< i n-local)
                (aset out i (aget data (+ off (aget sel (+ start i)))))
                (recur (unchecked-inc i))))
-           (I64Column. out n-local 0 (.has-nulls ic)))
+           (col/i64-like ic out n-local))
     :f64 (let [^F64Column fc c
                ^doubles data (.data fc)
                off (.offset fc)
@@ -708,7 +711,7 @@
              (when (< i n-local)
                (aset out i (aget data (+ off (aget sel (+ start i)))))
                (recur (unchecked-inc i))))
-           (F64Column. out n-local 0 (.has-nulls fc)))
+           (col/f64-like fc out n-local))
     :bool (let [^BoolColumn bc c
                 ^bytes data (.data bc)
                 off (.offset bc)
@@ -859,12 +862,12 @@
       (let [data (long-array n-new)]
         (System/arraycopy (.data ^I64Column acc-col) (.offset ^I64Column acc-col) data 0 n-acc)
         (System/arraycopy (.data ^I64Column part-col) (.offset ^I64Column part-col) data n-acc n-part)
-        (I64Column. data n-new 0 has-nulls))
+        (I64Column. data n-new 0 has-nulls (col/-logical-tag acc-col)))
       :f64
       (let [data (double-array n-new)]
         (System/arraycopy (.data ^F64Column acc-col) (.offset ^F64Column acc-col) data 0 n-acc)
         (System/arraycopy (.data ^F64Column part-col) (.offset ^F64Column part-col) data n-acc n-part)
-        (F64Column. data n-new 0 has-nulls))
+        (F64Column. data n-new 0 has-nulls (col/-logical-tag acc-col)))
       (:sym :str)
       (let [data (object-array n-new)]
         (System/arraycopy (obj-data acc-col) (obj-offset acc-col) data 0 n-acc)
@@ -973,7 +976,7 @@
         (if (empty? cols-list)
           (tbl/table schema
                      (vec (repeat (count schema)
-                                  (I64Column. (long-array 0) 0 0 false))))
+                                  (I64Column. (long-array 0) 0 0 false nil))))
           (tbl/table schema
                      (reduce (fn [acc cols] (mapv concat-columns acc cols))
                              (first cols-list)
@@ -986,14 +989,17 @@
 (defn- build-key-column
   "Build a typed column from a seq of key values, matching `proto-col`'s type."
   [proto-col vals]
-  (case (col/-type-tag proto-col)
-    :i64  (col/i64-column (map (fn [v] (when (some? v) (long v))) vals))
-    :f64  (col/f64-column vals)
-    :sym  (col/sym-column vals)
-    :str  (col/str-column vals)
-    :bool (col/bool-column vals)
-    (throw (IllegalArgumentException.
-            (str "Unsupported pivot key type: " (col/-type-tag proto-col))))))
+  (if-let [lg (col/-logical-tag proto-col)]
+    ;; logically-typed key (e.g. a date): re-encode the decoded values
+    (col/typed-column lg vals)
+    (case (col/-type-tag proto-col)
+      :i64  (col/i64-column (map (fn [v] (when (some? v) (long v))) vals))
+      :f64  (col/f64-column vals)
+      :sym  (col/sym-column vals)
+      :str  (col/str-column vals)
+      :bool (col/bool-column vals)
+      (throw (IllegalArgumentException.
+              (str "Unsupported pivot key type: " (col/-type-tag proto-col)))))))
 
 (defn- pivot-col-name
   "Turn a column-axis value into a keyword column name."

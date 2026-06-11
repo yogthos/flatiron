@@ -1,7 +1,8 @@
 (ns flatiron.window
   "Window functions over sorted columns."
   (:require [flatiron.column :as col]
-            [flatiron.table :as tbl])
+            [flatiron.table :as tbl]
+            [flatiron.types :as types])
   (:import [flatiron.column I64Column F64Column]))
 
 (set! *warn-on-reflection* true)
@@ -19,7 +20,7 @@
   (let [n (to-int (tbl/nrows table))
         ^longs c (long-array n)]
     (dotimes [i n] (aset c i (to-long (inc i))))
-    (I64Column. c n 0 false)))
+    (I64Column. c n 0 false nil)))
 
 ;; ════════════════════════════════════════════════════════════════════════
 ;; Rank — gaps after ties: 1, 1, 3, 3, 5
@@ -37,7 +38,7 @@
             (recur (inc i) next-rank 1))
           (do (aset out i (to-long current-rank))
               (recur (inc i) current-rank (inc rows-in-group))))))
-    (I64Column. out n 0 false)))
+    (I64Column. out n 0 false nil)))
 
 ;; ════════════════════════════════════════════════════════════════════════
 ;; Dense rank — no gaps: 1, 1, 2, 2, 3
@@ -55,7 +56,7 @@
             (recur (inc i) next-dense))
           (do (aset out i (to-long current-dense))
               (recur (inc i) current-dense)))))
-    (I64Column. out n 0 false)))
+    (I64Column. out n 0 false nil)))
 
 ;; ════════════════════════════════════════════════════════════════════════
 ;; Lag — value from previous row
@@ -69,22 +70,30 @@
           ^longs src (.data typed)
           off (.offset typed)
           ^longs dst (long-array n)
-          def (if (nil? default) col/NULL_I64 (to-long default))]
+          lg  (.logical typed)
+          def (to-long (cond (nil? default)                   col/NULL_I64
+                             (and lg (not (number? default))) (types/encode lg default)
+                             :else                            default))]
       (dotimes [i n]
         (let [idx (- i offset)]
           (aset dst i (if (< idx 0) def (aget src (+ off idx))))))
-      (I64Column. dst n 0 (.has-nulls typed)))
+      ;; a nil default writes NULL_I64 into the shifted-in slots, so the result
+      ;; is nullable even when the source was not — don't copy the source flag.
+      (I64Column. dst n 0 (boolean (or (.has-nulls typed) (nil? default))) lg))
     :f64
     (let [^flatiron.column.F64Column typed col
           n (to-int (.len typed))
           ^doubles src (.data typed)
           off (.offset typed)
           dst (double-array n)
-          def (if (nil? default) Double/NaN (double default))]
+          lg  (.logical typed)
+          def (double (cond (nil? default)                   Double/NaN
+                            (and lg (not (number? default))) (types/encode lg default)
+                            :else                            default))]
       (dotimes [i n]
         (let [idx (- i offset)]
           (aset dst i (if (< idx 0) def (aget src (+ off idx))))))
-      (F64Column. dst n 0 (.has-nulls typed)))
+      (F64Column. dst n 0 (boolean (or (.has-nulls typed) (nil? default))) lg))
     (throw (IllegalArgumentException. (str "lag not supported for " (col/-type-tag col))))))
 
 ;; ════════════════════════════════════════════════════════════════════════
@@ -99,20 +108,28 @@
           ^longs src (.data typed)
           off (.offset typed)
           ^longs dst (long-array n)
-          def (if (nil? default) col/NULL_I64 (to-long default))]
+          lg  (.logical typed)
+          def (to-long (cond (nil? default)                   col/NULL_I64
+                             (and lg (not (number? default))) (types/encode lg default)
+                             :else                            default))]
       (dotimes [i n]
         (let [idx (+ i offset)]
           (aset dst i (if (>= idx n) def (aget src (+ off idx))))))
-      (I64Column. dst n 0 (.has-nulls typed)))
+      ;; a nil default writes NULL_I64 into the shifted-in slots, so the result
+      ;; is nullable even when the source was not — don't copy the source flag.
+      (I64Column. dst n 0 (boolean (or (.has-nulls typed) (nil? default))) lg))
     :f64
     (let [^flatiron.column.F64Column typed col
           n (to-int (.len typed))
           ^doubles src (.data typed)
           off (.offset typed)
           dst (double-array n)
-          def (if (nil? default) Double/NaN (double default))]
+          lg  (.logical typed)
+          def (double (cond (nil? default)                   Double/NaN
+                            (and lg (not (number? default))) (types/encode lg default)
+                            :else                            default))]
       (dotimes [i n]
         (let [idx (+ i offset)]
           (aset dst i (if (>= idx n) def (aget src (+ off idx))))))
-      (F64Column. dst n 0 (.has-nulls typed)))
+      (F64Column. dst n 0 (boolean (or (.has-nulls typed) (nil? default))) lg))
     (throw (IllegalArgumentException. (str "lead not supported for " (col/-type-tag col))))))
