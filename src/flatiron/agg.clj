@@ -1,9 +1,10 @@
 (ns flatiron.agg
   "Aggregation functions on columns.
-   Single-pass morsel reduction — type dispatch once, then tight loop
-   with unboxed accumulator."
+   Direct-access fast paths read from column internals when no nulls present.
+   Morsel path retained for nullable columns and filtered/selected data."
   (:require [flatiron.column :as col]
-            [flatiron.morsel :as m]))
+            [flatiron.morsel :as m])
+  (:import [flatiron.column I64Column F64Column]))
 
 ;; ════════════════════════════════════════════════════════════════════════
 ;; I64 aggregations
@@ -12,91 +13,103 @@
 (defn i64-sum
   "Sum of an I64 column. Returns long. Nulls are skipped."
   ^long [col]
-  (let [ms   (m/i64-morsel-source col)
-        buf  (long-array m/MORSEL-SIZE)
-        n    (m/morsel-count ms)
-        has-n (col/-has-nulls? col)]
-    (if (and has-n (zero? n))
-      0
-      (let [null-sent col/NULL_I64]
+  (let [has-n (col/-has-nulls? col)]
+    (if has-n
+      (let [ms   (m/i64-morsel-source col)
+            buf  (long-array m/MORSEL-SIZE)
+            null-sent col/NULL_I64]
         (loop [total 0]
           (let [cnt (m/morsel-next-i64! ms buf 0 m/MORSEL-SIZE)]
             (if (zero? cnt)
               total
-              (recur (if has-n
-                       (loop [i 0, acc total]
-                         (if (< i cnt)
-                           (let [v (aget buf i)]
-                             (recur (unchecked-inc i)
-                                    (if (= v null-sent) acc (unchecked-add acc v))))
-                           acc))
-                       (loop [i 0, acc total]
-                         (if (< i cnt)
-                           (recur (unchecked-inc i) (unchecked-add acc (aget buf i)))
-                           acc)))))))))))
+              (recur (loop [i 0, acc total]
+                       (if (< i cnt)
+                         (let [v (aget buf i)]
+                           (recur (unchecked-inc i)
+                                  (if (= v null-sent) acc (unchecked-add acc v))))
+                         acc)))))))
+      (let [^I64Column c col
+            ^longs data (.data c)
+            off (.offset c)
+            n (.len c)]
+        (loop [i (int 0), total (long 0)]
+          (if (< i n)
+            (recur (unchecked-inc i) (unchecked-add total (aget data (+ off i))))
+            total))))))
 
 (defn i64-min
   "Minimum value in an I64 column. Returns nil if all null or empty."
   [col]
-  (let [ms   (m/i64-morsel-source col)
-        buf  (long-array m/MORSEL-SIZE)
-        has-n (col/-has-nulls? col)
-        null-sent col/NULL_I64]
-    (loop [best Long/MAX_VALUE, found false]
-      (let [cnt (m/morsel-next-i64! ms buf 0 m/MORSEL-SIZE)]
-        (if (zero? cnt)
-          (when found best)
-          (let [[new-best new-found]
-                (loop [i 0, b best, f found]
-                  (if (< i cnt)
-                    (let [v (aget buf i)]
-                      (if (and has-n (= v null-sent))
-                        (recur (unchecked-inc i) b f)
-                        (recur (unchecked-inc i) (min b v) true)))
-                    [b f]))]
-            (recur new-best new-found)))))))
+  (let [^I64Column c col
+        ^longs data (.data c)
+        off (.offset c)
+        n (.len c)
+        has-n (.has-nulls c)]
+    (if (zero? n)
+      nil
+      (if has-n
+        (let [null-sent col/NULL_I64]
+          (loop [i (int 0), best Long/MAX_VALUE, found false]
+            (if (< i n)
+              (let [v (aget data (+ off i))]
+                (if (= v null-sent)
+                  (recur (unchecked-inc i) best found)
+                  (recur (unchecked-inc i) (min best v) true)))
+              (when found best))))
+        (loop [i (int 0), best (aget data off)]
+          (if (< i n)
+            (let [v (aget data (+ off i))]
+              (recur (unchecked-inc i) (if (< v best) v best)))
+            best))))))
 
 (defn i64-max
   "Maximum value in an I64 column. Returns nil if all null or empty."
   [col]
-  (let [ms   (m/i64-morsel-source col)
-        buf  (long-array m/MORSEL-SIZE)
-        has-n (col/-has-nulls? col)
-        null-sent col/NULL_I64]
-    (loop [best Long/MIN_VALUE, found false]
-      (let [cnt (m/morsel-next-i64! ms buf 0 m/MORSEL-SIZE)]
-        (if (zero? cnt)
-          (when found best)
-          (let [[new-best new-found]
-                (loop [i 0, b best, f found]
-                  (if (< i cnt)
-                    (let [v (aget buf i)]
-                      (if (and has-n (= v null-sent))
-                        (recur (unchecked-inc i) b f)
-                        (recur (unchecked-inc i) (max b v) true)))
-                    [b f]))]
-            (recur new-best new-found)))))))
+  (let [^I64Column c col
+        ^longs data (.data c)
+        off (.offset c)
+        n (.len c)
+        has-n (.has-nulls c)]
+    (if (zero? n)
+      nil
+      (if has-n
+        (let [null-sent col/NULL_I64]
+          (loop [i (int 0), best Long/MIN_VALUE, found false]
+            (if (< i n)
+              (let [v (aget data (+ off i))]
+                (if (= v null-sent)
+                  (recur (unchecked-inc i) best found)
+                  (recur (unchecked-inc i) (max best v) true)))
+              (when found best))))
+        (loop [i (int 0), best (aget data off)]
+          (if (< i n)
+            (let [v (aget data (+ off i))]
+              (recur (unchecked-inc i) (if (> v best) v best)))
+            best))))))
 
 (defn i64-avg
-  "Average of an I64 column. Returns double. Nulls are skipped. Returns nil if no non-null rows."
+  "Average of an I64 column. Returns double. Nulls are skipped."
   [col]
-  (let [ms   (m/i64-morsel-source col)
-        buf  (long-array m/MORSEL-SIZE)
-        has-n (col/-has-nulls? col)
-        null-sent col/NULL_I64]
-    (loop [sum 0.0, cnt 0]
-      (let [n (m/morsel-next-i64! ms buf 0 m/MORSEL-SIZE)]
-        (if (zero? n)
-          (when (pos? cnt) (/ sum (double cnt)))
-          (let [[new-sum new-cnt]
-                (loop [i 0, s sum, c cnt]
-                  (if (< i n)
-                    (let [v (aget buf i)]
-                      (if (and has-n (= v null-sent))
-                        (recur (unchecked-inc i) s c)
-                        (recur (unchecked-inc i) (+ s (double v)) (unchecked-inc c))))
-                    [s c]))]
-            (recur new-sum new-cnt)))))))
+  (let [^I64Column c col
+        ^longs data (.data c)
+        off (.offset c)
+        n (.len c)
+        has-n (.has-nulls c)]
+    (if (zero? n)
+      nil
+      (if has-n
+        (let [null-sent col/NULL_I64]
+          (loop [i (int 0), sum (double 0.0), cnt (int 0)]
+            (if (< i n)
+              (let [v (aget data (+ off i))]
+                (if (= v null-sent)
+                  (recur (unchecked-inc i) sum cnt)
+                  (recur (unchecked-inc i) (+ sum (double v)) (unchecked-inc cnt))))
+              (if (pos? cnt) (/ sum (double cnt)) nil))))
+        (loop [i (int 0), sum (double 0.0)]
+          (if (< i n)
+            (recur (unchecked-inc i) (+ sum (double (aget data (+ off i)))))
+            (/ sum (double n))))))))
 
 ;; ════════════════════════════════════════════════════════════════════════
 ;; F64 aggregations
@@ -105,84 +118,93 @@
 (defn f64-sum
   "Sum of an F64 column. Returns double. Nulls (NaN) are skipped."
   ^double [col]
-  (let [ms   (m/f64-morsel-source col)
-        buf  (double-array m/MORSEL-SIZE)
-        has-n (col/-has-nulls? col)]
-    (loop [total 0.0]
-      (let [cnt (m/morsel-next-f64! ms buf 0 m/MORSEL-SIZE)]
-        (if (zero? cnt)
-          total
-          (recur (if has-n
-                   (loop [i 0, acc total]
-                     (if (< i cnt)
-                       (let [v (aget buf i)]
-                         (recur (unchecked-inc i)
-                                (if (Double/isNaN v) acc (+ acc v))))
-                       acc))
-                   (loop [i 0, acc total]
-                     (if (< i cnt)
-                       (recur (unchecked-inc i) (+ acc (aget buf i)))
-                       acc)))))))))
+  (let [^F64Column c col
+        ^doubles data (.data c)
+        off (.offset c)
+        n (.len c)
+        has-n (.has-nulls c)]
+    (if has-n
+      (loop [i (int 0), total (double 0.0)]
+        (if (< i n)
+          (let [v (aget data (+ off i))]
+            (recur (unchecked-inc i)
+                   (if (Double/isNaN v) total (+ total v))))
+          total))
+      (loop [i (int 0), total (double 0.0)]
+        (if (< i n)
+          (recur (unchecked-inc i) (+ total (aget data (+ off i))))
+          total)))))
 
 (defn f64-min
   "Minimum value in an F64 column. Returns nil if all null or empty."
   [col]
-  (let [ms   (m/f64-morsel-source col)
-        buf  (double-array m/MORSEL-SIZE)
-        has-n (col/-has-nulls? col)]
-    (loop [best Double/MAX_VALUE, found false]
-      (let [cnt (m/morsel-next-f64! ms buf 0 m/MORSEL-SIZE)]
-        (if (zero? cnt)
-          (when found best)
-          (let [[new-best new-found]
-                (loop [i 0, b best, f found]
-                  (if (< i cnt)
-                    (let [v (aget buf i)]
-                      (if (and has-n (Double/isNaN v))
-                        (recur (unchecked-inc i) b f)
-                        (recur (unchecked-inc i) (min b v) true)))
-                    [b f]))]
-            (recur new-best new-found)))))))
+  (let [^F64Column c col
+        ^doubles data (.data c)
+        off (.offset c)
+        n (.len c)
+        has-n (.has-nulls c)]
+    (if (zero? n)
+      nil
+      (if has-n
+        (loop [i (int 0), best Double/MAX_VALUE, found false]
+          (if (< i n)
+            (let [v (aget data (+ off i))]
+              (if (Double/isNaN v)
+                (recur (unchecked-inc i) best found)
+                (recur (unchecked-inc i) (min best v) true)))
+            (when found best)))
+        (loop [i (int 0), best (aget data off)]
+          (if (< i n)
+            (let [v (aget data (+ off i))]
+              (recur (unchecked-inc i) (if (< v best) v best)))
+            best))))))
 
 (defn f64-max
   "Maximum value in an F64 column. Returns nil if all null or empty."
   [col]
-  (let [ms   (m/f64-morsel-source col)
-        buf  (double-array m/MORSEL-SIZE)
-        has-n (col/-has-nulls? col)]
-    (loop [best (- Double/MAX_VALUE), found false]
-      (let [cnt (m/morsel-next-f64! ms buf 0 m/MORSEL-SIZE)]
-        (if (zero? cnt)
-          (when found best)
-          (let [[new-best new-found]
-                (loop [i 0, b best, f found]
-                  (if (< i cnt)
-                    (let [v (aget buf i)]
-                      (if (and has-n (Double/isNaN v))
-                        (recur (unchecked-inc i) b f)
-                        (recur (unchecked-inc i) (max b v) true)))
-                    [b f]))]
-            (recur new-best new-found)))))))
+  (let [^F64Column c col
+        ^doubles data (.data c)
+        off (.offset c)
+        n (.len c)
+        has-n (.has-nulls c)]
+    (if (zero? n)
+      nil
+      (if has-n
+        (loop [i (int 0), best (- Double/MAX_VALUE), found false]
+          (if (< i n)
+            (let [v (aget data (+ off i))]
+              (if (Double/isNaN v)
+                (recur (unchecked-inc i) best found)
+                (recur (unchecked-inc i) (max best v) true)))
+            (when found best)))
+        (loop [i (int 0), best (aget data off)]
+          (if (< i n)
+            (let [v (aget data (+ off i))]
+              (recur (unchecked-inc i) (if (> v best) v best)))
+            best))))))
 
 (defn f64-avg
-  "Average of an F64 column. Returns double. Nulls (NaN) are skipped. Returns nil if no non-null rows."
+  "Average of an F64 column. Returns double. Nulls (NaN) are skipped."
   [col]
-  (let [ms   (m/f64-morsel-source col)
-        buf  (double-array m/MORSEL-SIZE)
-        has-n (col/-has-nulls? col)]
-    (loop [sum 0.0, cnt 0]
-      (let [n (m/morsel-next-f64! ms buf 0 m/MORSEL-SIZE)]
-        (if (zero? n)
-          (when (pos? cnt) (/ sum (double cnt)))
-          (let [[new-sum new-cnt]
-                (loop [i 0, s sum, c cnt]
-                  (if (< i n)
-                    (let [v (aget buf i)]
-                      (if (and has-n (Double/isNaN v))
-                        (recur (unchecked-inc i) s c)
-                        (recur (unchecked-inc i) (+ s v) (unchecked-inc c))))
-                    [s c]))]
-            (recur new-sum new-cnt)))))))
+  (let [^F64Column c col
+        ^doubles data (.data c)
+        off (.offset c)
+        n (.len c)
+        has-n (.has-nulls c)]
+    (if (zero? n)
+      nil
+      (if has-n
+        (loop [i (int 0), sum (double 0.0), cnt (int 0)]
+          (if (< i n)
+            (let [v (aget data (+ off i))]
+              (if (Double/isNaN v)
+                (recur (unchecked-inc i) sum cnt)
+                (recur (unchecked-inc i) (+ sum v) (unchecked-inc cnt))))
+            (if (pos? cnt) (/ sum (double cnt)) nil)))
+        (loop [i (int 0), sum (double 0.0)]
+          (if (< i n)
+            (recur (unchecked-inc i) (+ sum (aget data (+ off i))))
+            (/ sum (double n))))))))
 
 ;; ════════════════════════════════════════════════════════════════════════
 ;; Count
@@ -193,36 +215,29 @@
   ^long [col]
   (let [tag (col/-type-tag col)]
     (case tag
-      :i64  (let [ms   (m/i64-morsel-source col)
-                  buf  (long-array m/MORSEL-SIZE)
-                  has-n (col/-has-nulls? col)
-                  null-sent col/NULL_I64]
+      :i64  (let [^I64Column c col
+                  n (.len c)
+                  has-n (.has-nulls c)]
               (if has-n
-                (loop [total 0]
-                  (let [cnt (m/morsel-next-i64! ms buf 0 m/MORSEL-SIZE)]
-                    (if (zero? cnt)
-                      total
-                      (recur (loop [i 0, acc total]
-                               (if (< i cnt)
-                                 (let [v (aget buf i)]
-                                   (recur (unchecked-inc i)
-                                          (if (= v null-sent) acc (unchecked-inc acc))))
-                                 acc))))))
-                (m/morsel-count col)))
-      :f64  (let [ms   (m/f64-morsel-source col)
-                  buf  (double-array m/MORSEL-SIZE)
-                  has-n (col/-has-nulls? col)]
+                (let [^longs data (.data c)
+                      off (.offset c)
+                      null-sent col/NULL_I64]
+                  (loop [i (int 0), cnt (int 0)]
+                    (if (< i n)
+                      (recur (unchecked-inc i)
+                             (if (= (aget data (+ off i)) null-sent) cnt (unchecked-inc cnt)))
+                      cnt)))
+                n))
+      :f64  (let [^F64Column c col
+                  n (.len c)
+                  has-n (.has-nulls c)]
               (if has-n
-                (loop [total 0]
-                  (let [cnt (m/morsel-next-f64! ms buf 0 m/MORSEL-SIZE)]
-                    (if (zero? cnt)
-                      total
-                      (recur (loop [i 0, acc total]
-                               (if (< i cnt)
-                                 (let [v (aget buf i)]
-                                   (recur (unchecked-inc i)
-                                          (if (Double/isNaN v) acc (unchecked-inc acc))))
-                                 acc))))))
-                (m/morsel-count col)))
-      ;; Non-nullable types: count = len
+                (let [^doubles data (.data c)
+                      off (.offset c)]
+                  (loop [i (int 0), cnt (int 0)]
+                    (if (< i n)
+                      (recur (unchecked-inc i)
+                             (if (Double/isNaN (aget data (+ off i))) cnt (unchecked-inc cnt)))
+                      cnt)))
+                n))
       (col/-len col))))

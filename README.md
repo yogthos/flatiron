@@ -1,5 +1,7 @@
 # Flatiron
 
+<img src="img/logo.svg" alt="Flatiron logo" width="800" />
+
 Flatiron is a columnar analytics library for Clojure. It lets you run fast analytical queries on in-memory tables using a SQL-like DSL, and it handles graph algorithms on the same data. It's pure Clojure with no dependencies beyond core.async.
 
 Think of it as what you'd reach for instead of dragging in a full embedded database: load some data, run group-by aggregations, sort and filter, maybe run PageRank on a graph, all in-process with zero configuration.

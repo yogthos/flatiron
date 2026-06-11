@@ -2,11 +2,39 @@
   "Group-by aggregation using open-addressing hash tables.
    Two-pass single-threaded: Pass 1 builds group assignment,
    Pass 2 accumulates aggregation values per group."
-  (:require [flatiron.column :as col]
+  (:require [clojure.core.async :as a]
+            [flatiron.column :as col]
             [flatiron.hash :as h]
             [flatiron.morsel :as m]
             [flatiron.table :as tbl])
   (:import [flatiron.column I64Column F64Column SymColumn StrColumn]))
+
+;; ════════════════════════════════════════════════════════════════════════
+;; Fast hashing — avoid BigInteger wyhash for prehash step
+;; ════════════════════════════════════════════════════════════════════════
+
+(def ^:const ^long HASH-K1 (unchecked-long 0xC6A4A7935BD1E995))
+(def ^:const ^long HASH-K2 (unchecked-long 0xBF58476D1CE4E5B9))
+(def ^:const ^long HASH-K3 (unchecked-long 0x94D049BB133111EB))
+(def ^:const ^long HASH-K4 (unchecked-long 0x9E3779B97F4A7C15))
+
+(defn- fast-int-hash ^long [h]
+  "Fast 64-bit hash from a 32-bit integer. Good distribution, no BigInteger."
+  (let [x (bit-xor (unchecked-int h) 0x9E3779B9)]
+    (unchecked-multiply (long x) HASH-K1)))
+
+(defn- fast-long-hash ^long [^long v]
+  "Fast 64-bit hash from a 64-bit integer using split-mix64."
+  (let [x (unchecked-add v HASH-K4)
+        x (bit-xor x (unsigned-bit-shift-right x 30))
+        x (unchecked-multiply x HASH-K2)
+        x (bit-xor x (unsigned-bit-shift-right x 27))
+        x (unchecked-multiply x HASH-K3)]
+    (bit-xor x (unsigned-bit-shift-right x 31))))
+
+(defn- fast-double-hash ^long [^double v]
+  (let [bits (if (== v 0.0) 0 (Double/doubleToLongBits v))]
+    (fast-long-hash bits)))
 
 ;; ════════════════════════════════════════════════════════════════════════
 ;; Hash table build
@@ -15,50 +43,41 @@
 (def ^:const ^long HT-EMPTY h/HT-EMPTY)
 
 (defn- prehash-i64-column ^longs [key-col]
-  (let [nrows (col/-len key-col)
-        out   (long-array nrows)
-        ms    (m/i64-morsel-source key-col)
-        buf   (long-array m/MORSEL-SIZE)]
-    (loop [off 0]
-      (let [cnt (m/morsel-next-i64! ms buf 0 m/MORSEL-SIZE)]
-        (when (pos? cnt)
-          (loop [i 0]
-            (when (< i cnt)
-              (aset out (+ off i) (h/hash-i64 (aget buf i)))
-              (recur (unchecked-inc i))))
-          (recur (+ off cnt)))))
+  (let [^I64Column c key-col
+        ^longs data (.data c)
+        off (.offset c)
+        n (.len c)
+        out (long-array n)]
+    (loop [i (int 0)]
+      (when (< i n)
+        (aset out i (fast-long-hash (aget data (+ off i))))
+        (recur (unchecked-inc i))))
     out))
 
 (defn- prehash-f64-column ^longs [key-col]
-  (let [nrows (col/-len key-col)
-        out   (long-array nrows)
-        ms    (m/f64-morsel-source key-col)
-        buf   (double-array m/MORSEL-SIZE)]
-    (loop [off 0]
-      (let [cnt (m/morsel-next-f64! ms buf 0 m/MORSEL-SIZE)]
-        (when (pos? cnt)
-          (loop [i 0]
-            (when (< i cnt)
-              (aset out (+ off i) (h/hash-f64 (aget buf i)))
-              (recur (unchecked-inc i))))
-          (recur (+ off cnt)))))
+  (let [^F64Column c key-col
+        ^doubles data (.data c)
+        off (.offset c)
+        n (.len c)
+        out (long-array n)]
+    (loop [i (int 0)]
+      (when (< i n)
+        (aset out i (fast-double-hash (aget data (+ off i))))
+        (recur (unchecked-inc i))))
     out))
 
 (defn- prehash-obj-column ^longs [key-col]
-  (let [nrows (col/-len key-col)
-        out   (long-array nrows)
-        ms    (m/obj-morsel-source key-col)
-        buf   (object-array m/MORSEL-SIZE)]
-    (loop [off 0]
-      (let [cnt (m/morsel-next-obj! ms buf 0 m/MORSEL-SIZE)]
-        (when (pos? cnt)
-          (loop [i 0]
-            (when (< i cnt)
-              (let [obj (aget buf i)]
-                (aset out (+ off i)
-                      (h/hash-i64 (if (nil? obj) 0 (long (.hashCode obj))))))
-              (recur (unchecked-inc i))))
-          (recur (+ off cnt)))))
+  (let [^SymColumn c key-col
+        ^objects data (.data c)
+        off (.offset c)
+        n (.len c)
+        out (long-array n)]
+    (loop [i (int 0)]
+      (when (< i n)
+        (let [obj (aget data (+ off i))
+              h (if (nil? obj) 0 (.hashCode ^Object obj))]
+          (aset out i (fast-int-hash h))
+          (recur (unchecked-inc i)))))
     out))
 
 (defn- prehash-column ^longs [key-col]
@@ -140,196 +159,213 @@
       [(long (aget next-gid 0)) row-groups])))
 
 ;; ════════════════════════════════════════════════════════════════════════
-;; Aggregation accumulation
+;; Aggregation accumulation — direct-access fast paths
+;; Bypasses morsel layer entirely for non-nullable columns.
+;; Reads directly from the column's backing primitive array.
 ;; ════════════════════════════════════════════════════════════════════════
 
-(defn- accumulate-i64-sum! [val-col row-groups ^longs sums]
-  (let [has-nulls (col/-has-nulls? val-col)
-        ms  (m/i64-morsel-source val-col)
-        buf (long-array m/MORSEL-SIZE)]
-    (loop [off 0]
-      (let [cnt (m/morsel-next-i64! ms buf 0 m/MORSEL-SIZE)]
-        (when (pos? cnt)
-          (if has-nulls
-            (loop [i 0]
-              (when (< i cnt)
-                (let [v (aget buf i)
-                      g (aget row-groups (+ off i))]
-                  (when (not= v col/NULL_I64)
-                    (aset sums g (unchecked-add (aget sums g) v))))
-                (recur (unchecked-inc i))))
-            (loop [i 0]
-              (when (< i cnt)
-                (let [v (aget buf i)
-                      g (aget row-groups (+ off i))]
-                  (aset sums g (unchecked-add (aget sums g) v))
-                  (recur (unchecked-inc i))))))
-          (recur (+ off cnt)))))))
+(defn- accumulate-i64-sum! [val-col ^ints row-groups ^longs sums]
+  (let [^I64Column c val-col
+        ^longs data (.data c)
+        col-off (.offset c)
+        n (.len c)
+        has-nulls (.has-nulls c)]
+    (if has-nulls
+      (let [null-sent col/NULL_I64]
+        (loop [i (int 0)]
+          (when (< i n)
+            (let [v (aget data (+ col-off i))]
+              (when (not= v null-sent)
+                (let [g (aget row-groups i)]
+                  (aset sums g (unchecked-add (aget sums g) v)))))
+            (recur (unchecked-inc i)))))
+      (loop [i (int 0)]
+        (when (< i n)
+          (let [v (aget data (+ col-off i))
+                g (aget row-groups i)]
+            (aset sums g (unchecked-add (aget sums g) v)))
+          (recur (unchecked-inc i)))))))
 
-(defn- accumulate-i64-count! [val-col row-groups ^longs counts]
-  (let [has-nulls (col/-has-nulls? val-col)
-        ms  (m/i64-morsel-source val-col)
-        buf (long-array m/MORSEL-SIZE)]
-    (loop [off 0]
-      (let [cnt (m/morsel-next-i64! ms buf 0 m/MORSEL-SIZE)]
-        (when (pos? cnt)
-          (if has-nulls
-            (loop [i 0]
-              (when (< i cnt)
-                (let [v (aget buf i)
-                      g (aget row-groups (+ off i))]
-                  (when (not= v col/NULL_I64)
-                    (aset counts g (unchecked-inc (aget counts g)))))
-                (recur (unchecked-inc i))))
-            (loop [i 0]
-              (when (< i cnt)
-                (let [g (aget row-groups (+ off i))]
-                  (aset counts g (unchecked-inc (aget counts g)))
-                  (recur (unchecked-inc i))))))
-          (recur (+ off cnt)))))))
+(defn- accumulate-i64-count! [val-col ^ints row-groups ^longs counts]
+  (let [^I64Column c val-col
+        ^longs data (.data c)
+        col-off (.offset c)
+        n (.len c)
+        has-nulls (.has-nulls c)]
+    (if has-nulls
+      (let [null-sent col/NULL_I64]
+        (loop [i (int 0)]
+          (when (< i n)
+            (let [v (aget data (+ col-off i))]
+              (when (not= v null-sent)
+                (let [g (aget row-groups i)]
+                  (aset counts g (unchecked-inc (aget counts g)))))
+              (recur (unchecked-inc i))))))
+      (loop [i (int 0)]
+        (when (< i n)
+          (let [g (aget row-groups i)]
+            (aset counts g (unchecked-inc (aget counts g))))
+          (recur (unchecked-inc i)))))))
 
-(defn- accumulate-i64-min! [val-col row-groups ^longs mins]
-  (let [has-nulls (col/-has-nulls? val-col)
-        ms  (m/i64-morsel-source val-col)
-        buf (long-array m/MORSEL-SIZE)]
-    (loop [off 0]
-      (let [cnt (m/morsel-next-i64! ms buf 0 m/MORSEL-SIZE)]
-        (when (pos? cnt)
-          (loop [i 0]
-            (when (< i cnt)
-              (let [v (aget buf i)
-                    g (aget row-groups (+ off i))]
-                (when (or (not has-nulls) (not= v col/NULL_I64))
+(defn- accumulate-i64-min! [val-col ^ints row-groups ^longs mins]
+  (let [^I64Column c val-col
+        ^longs data (.data c)
+        col-off (.offset c)
+        n (.len c)
+        has-nulls (.has-nulls c)]
+    (if has-nulls
+      (let [null-sent col/NULL_I64]
+        (loop [i (int 0)]
+          (when (< i n)
+            (let [v (aget data (+ col-off i))]
+              (when (not= v null-sent)
+                (let [g (aget row-groups i)]
                   (aset mins g (min (aget mins g) v))))
-              (recur (unchecked-inc i))))
-          (recur (+ off cnt)))))))
+              (recur (unchecked-inc i))))))
+      (loop [i (int 0)]
+        (when (< i n)
+          (let [v (aget data (+ col-off i))
+                g (aget row-groups i)]
+            (aset mins g (min (aget mins g) v)))
+          (recur (unchecked-inc i)))))))
 
-(defn- accumulate-i64-max! [val-col row-groups ^longs maxs]
-  (let [has-nulls (col/-has-nulls? val-col)
-        ms  (m/i64-morsel-source val-col)
-        buf (long-array m/MORSEL-SIZE)]
-    (loop [off 0]
-      (let [cnt (m/morsel-next-i64! ms buf 0 m/MORSEL-SIZE)]
-        (when (pos? cnt)
-          (loop [i 0]
-            (when (< i cnt)
-              (let [v (aget buf i)
-                    g (aget row-groups (+ off i))]
-                (when (or (not has-nulls) (not= v col/NULL_I64))
+(defn- accumulate-i64-max! [val-col ^ints row-groups ^longs maxs]
+  (let [^I64Column c val-col
+        ^longs data (.data c)
+        col-off (.offset c)
+        n (.len c)
+        has-nulls (.has-nulls c)]
+    (if has-nulls
+      (let [null-sent col/NULL_I64]
+        (loop [i (int 0)]
+          (when (< i n)
+            (let [v (aget data (+ col-off i))]
+              (when (not= v null-sent)
+                (let [g (aget row-groups i)]
                   (aset maxs g (max (aget maxs g) v))))
-              (recur (unchecked-inc i))))
-          (recur (+ off cnt)))))))
+              (recur (unchecked-inc i))))))
+      (loop [i (int 0)]
+        (when (< i n)
+          (let [v (aget data (+ col-off i))
+                g (aget row-groups i)]
+            (aset maxs g (max (aget maxs g) v)))
+          (recur (unchecked-inc i)))))))
 
-(defn- accumulate-i64-avg! [val-col row-groups ^longs sums ^longs counts]
-  (let [has-nulls (col/-has-nulls? val-col)
-        ms  (m/i64-morsel-source val-col)
-        buf (long-array m/MORSEL-SIZE)]
-    (loop [off 0]
-      (let [cnt (m/morsel-next-i64! ms buf 0 m/MORSEL-SIZE)]
-        (when (pos? cnt)
-          (loop [i 0]
-            (when (< i cnt)
-              (let [v (aget buf i)
-                    g (aget row-groups (+ off i))]
-                (when (or (not has-nulls) (not= v col/NULL_I64))
+(defn- accumulate-i64-avg! [val-col ^ints row-groups ^longs sums ^longs counts]
+  (let [^I64Column c val-col
+        ^longs data (.data c)
+        col-off (.offset c)
+        n (.len c)
+        has-nulls (.has-nulls c)]
+    (if has-nulls
+      (let [null-sent col/NULL_I64]
+        (loop [i (int 0)]
+          (when (< i n)
+            (let [v (aget data (+ col-off i))]
+              (when (not= v null-sent)
+                (let [g (aget row-groups i)]
                   (aset sums g (unchecked-add (aget sums g) v))
                   (aset counts g (unchecked-inc (aget counts g)))))
-              (recur (unchecked-inc i))))
-          (recur (+ off cnt)))))))
+              (recur (unchecked-inc i))))))
+      (loop [i (int 0)]
+        (when (< i n)
+          (let [v (aget data (+ col-off i))
+                g (aget row-groups i)]
+            (aset sums g (unchecked-add (aget sums g) v))
+            (aset counts g (unchecked-inc (aget counts g))))
+          (recur (unchecked-inc i)))))))
 
 ;; F64 variants
 
-(defn- accumulate-f64-sum! [val-col row-groups ^doubles sums]
-  (let [has-nulls (col/-has-nulls? val-col)
-        ms  (m/f64-morsel-source val-col)
-        buf (double-array m/MORSEL-SIZE)]
-    (loop [off 0]
-      (let [cnt (m/morsel-next-f64! ms buf 0 m/MORSEL-SIZE)]
-        (when (pos? cnt)
-          (if has-nulls
-            (loop [i 0]
-              (when (< i cnt)
-                (let [v (aget buf i)
-                      g (aget row-groups (+ off i))]
-                  (when (not (Double/isNaN v))
-                    (aset sums g (+ (aget sums g) v))))
-                (recur (unchecked-inc i))))
-            (loop [i 0]
-              (when (< i cnt)
-                (let [v (aget buf i)
-                      g (aget row-groups (+ off i))]
-                  (aset sums g (+ (aget sums g) v))
-                  (recur (unchecked-inc i))))))
-          (recur (+ off cnt)))))))
+(defn- accumulate-f64-sum! [val-col ^ints row-groups ^doubles sums]
+  (let [^F64Column c val-col
+        ^doubles data (.data c)
+        col-off (.offset c)
+        n (.len c)
+        has-nulls (.has-nulls c)]
+    (if has-nulls
+      (loop [i (int 0)]
+        (when (< i n)
+          (let [v (aget data (+ col-off i))]
+            (when (not (Double/isNaN v))
+              (let [g (aget row-groups i)]
+                (aset sums g (+ (aget sums g) v))))
+            (recur (unchecked-inc i)))))
+      (loop [i (int 0)]
+        (when (< i n)
+          (let [v (aget data (+ col-off i))
+                g (aget row-groups i)]
+            (aset sums g (+ (aget sums g) v)))
+          (recur (unchecked-inc i)))))))
 
-(defn- accumulate-f64-count! [val-col row-groups ^longs counts]
-  (let [has-nulls (col/-has-nulls? val-col)
-        ms  (m/f64-morsel-source val-col)
-        buf (double-array m/MORSEL-SIZE)]
-    (loop [off 0]
-      (let [cnt (m/morsel-next-f64! ms buf 0 m/MORSEL-SIZE)]
-        (when (pos? cnt)
-          (if has-nulls
-            (loop [i 0]
-              (when (< i cnt)
-                (let [v (aget buf i)
-                      g (aget row-groups (+ off i))]
-                  (when (not (Double/isNaN v))
-                    (aset counts g (unchecked-inc (aget counts g)))))
-                (recur (unchecked-inc i))))
-            (loop [i 0]
-              (when (< i cnt)
-                (let [g (aget row-groups (+ off i))]
-                  (aset counts g (unchecked-inc (aget counts g)))
-                  (recur (unchecked-inc i))))))
-          (recur (+ off cnt)))))))
+(defn- accumulate-f64-count! [val-col ^ints row-groups ^longs counts]
+  (let [^F64Column c val-col
+        ^doubles data (.data c)
+        col-off (.offset c)
+        n (.len c)
+        has-nulls (.has-nulls c)]
+    (if has-nulls
+      (loop [i (int 0)]
+        (when (< i n)
+          (let [v (aget data (+ col-off i))]
+            (when (not (Double/isNaN v))
+              (let [g (aget row-groups i)]
+                (aset counts g (unchecked-inc (aget counts g)))))
+            (recur (unchecked-inc i)))))
+      (loop [i (int 0)]
+        (when (< i n)
+          (let [g (aget row-groups i)]
+            (aset counts g (unchecked-inc (aget counts g))))
+          (recur (unchecked-inc i)))))))
 
-(defn- accumulate-f64-min! [val-col row-groups ^doubles mins]
-  (let [ms  (m/f64-morsel-source val-col)
-        buf (double-array m/MORSEL-SIZE)]
-    (loop [off 0]
-      (let [cnt (m/morsel-next-f64! ms buf 0 m/MORSEL-SIZE)]
-        (when (pos? cnt)
-          (loop [i 0]
-            (when (< i cnt)
-              (let [v (aget buf i)
-                    g (aget row-groups (+ off i))]
-                (when (not (Double/isNaN v))
-                  (aset mins g (min (aget mins g) v))))
-              (recur (unchecked-inc i))))
-          (recur (+ off cnt)))))))
+(defn- accumulate-f64-min! [val-col ^ints row-groups ^doubles mins]
+  (let [^F64Column c val-col
+        ^doubles data (.data c)
+        col-off (.offset c)
+        n (.len c)]
+    (loop [i (int 0)]
+      (when (< i n)
+        (let [v (aget data (+ col-off i))]
+          (when (not (Double/isNaN v))
+            (let [g (aget row-groups i)]
+              (aset mins g (min (aget mins g) v))))
+          (recur (unchecked-inc i)))))))
 
-(defn- accumulate-f64-max! [val-col row-groups ^doubles maxs]
-  (let [ms  (m/f64-morsel-source val-col)
-        buf (double-array m/MORSEL-SIZE)]
-    (loop [off 0]
-      (let [cnt (m/morsel-next-f64! ms buf 0 m/MORSEL-SIZE)]
-        (when (pos? cnt)
-          (loop [i 0]
-            (when (< i cnt)
-              (let [v (aget buf i)
-                    g (aget row-groups (+ off i))]
-                (when (not (Double/isNaN v))
-                  (aset maxs g (max (aget maxs g) v))))
-              (recur (unchecked-inc i))))
-          (recur (+ off cnt)))))))
+(defn- accumulate-f64-max! [val-col ^ints row-groups ^doubles maxs]
+  (let [^F64Column c val-col
+        ^doubles data (.data c)
+        col-off (.offset c)
+        n (.len c)]
+    (loop [i (int 0)]
+      (when (< i n)
+        (let [v (aget data (+ col-off i))]
+          (when (not (Double/isNaN v))
+            (let [g (aget row-groups i)]
+              (aset maxs g (max (aget maxs g) v))))
+          (recur (unchecked-inc i)))))))
 
-(defn- accumulate-f64-avg! [val-col row-groups ^doubles sums ^longs counts]
-  (let [has-nulls (col/-has-nulls? val-col)
-        ms  (m/f64-morsel-source val-col)
-        buf (double-array m/MORSEL-SIZE)]
-    (loop [off 0]
-      (let [cnt (m/morsel-next-f64! ms buf 0 m/MORSEL-SIZE)]
-        (when (pos? cnt)
-          (loop [i 0]
-            (when (< i cnt)
-              (let [v (aget buf i)
-                    g (aget row-groups (+ off i))]
-                (when (or (not has-nulls) (not (Double/isNaN v)))
-                  (aset sums g (+ (aget sums g) v))
-                  (aset counts g (unchecked-inc (aget counts g)))))
-              (recur (unchecked-inc i))))
-          (recur (+ off cnt)))))))
+(defn- accumulate-f64-avg! [val-col ^ints row-groups ^doubles sums ^longs counts]
+  (let [^F64Column c val-col
+        ^doubles data (.data c)
+        col-off (.offset c)
+        n (.len c)
+        has-nulls (.has-nulls c)]
+    (if has-nulls
+      (loop [i (int 0)]
+        (when (< i n)
+          (let [v (aget data (+ col-off i))]
+            (when (not (Double/isNaN v))
+              (let [g (aget row-groups i)]
+                (aset sums g (+ (aget sums g) v))
+                (aset counts g (unchecked-inc (aget counts g)))))
+            (recur (unchecked-inc i)))))
+      (loop [i (int 0)]
+        (when (< i n)
+          (let [v (aget data (+ col-off i))
+                g (aget row-groups i)]
+            (aset sums g (+ (aget sums g) v))
+            (aset counts g (unchecked-inc (aget counts g))))
+          (recur (unchecked-inc i)))))))
 
 ;; ════════════════════════════════════════════════════════════════════════
 ;; Key column compression
@@ -509,6 +545,286 @@
         (tbl/table (vec (concat key-names (vec agg-names)))
                    (vec (concat result-keys (vec agg-cols))))))))
 
+;; ════════════════════════════════════════════════════════════════════════
+;; Parallel radix-partitioned group-by
+;; ════════════════════════════════════════════════════════════════════════
+
+(def ^:const ^long DEFAULT-PARALLELISM 4)
+
+(defn- radix-bits ^long [^long n-threads]
+  "Number of radix bits for ~2× n-threads partitions (power of two)."
+  (let [target (* 2 n-threads)]
+    (loop [bits 2]
+      (if (>= (bit-shift-left 1 bits) target)
+        (min bits 10)
+        (recur (unchecked-inc bits))))))
+
+(defn- partition-local-group-by [key-cols key-names table aggs
+                                 local-rows ^longs local-hashes n-local
+                                 cap]
+  "Build HT and accumulate for a single partition. Returns [schema cols].
+   Called from parallel worker threads — no shared mutable state."
+  (let [n-local (int n-local)
+        cap (int cap)
+        cap-mask (unchecked-dec cap)
+        ht-hash  (long-array cap)
+        ht-groups (int-array cap)
+        row-groups (int-array n-local)
+        next-gid (int-array 1)]
+    (java.util.Arrays/fill ht-hash HT-EMPTY)
+    (dotimes [i n-local]
+      (let [hash (aget local-hashes i)
+            slot (loop [s (bit-and hash cap-mask)]
+                   (let [k (aget ht-hash s)]
+                     (if (or (== k HT-EMPTY) (== k hash))
+                       s
+                       (recur (bit-and (unchecked-inc s) cap-mask)))))]
+        (if (== (aget ht-hash slot) HT-EMPTY)
+          (let [gid (aget next-gid 0)]
+            (aset ht-hash slot hash)
+            (aset ht-groups slot gid)
+            (aset row-groups i gid)
+            (aset next-gid 0 (unchecked-inc gid)))
+          (aset row-groups i (aget ht-groups slot)))))
+    (let [n-groups (aget next-gid 0)]
+      (if (zero? n-groups)
+        nil
+        (let [result-key-cols
+              (mapv (fn [kc]
+                      (let [tag (col/-type-tag kc)
+                            seen (boolean-array n-groups)]
+                        (case tag
+                          :i64
+                          (let [^I64Column c kc
+                                ^longs data (.data c)
+                                off (.offset c)
+                                out (long-array n-groups)]
+                            (dotimes [i n-local]
+                              (let [g (aget row-groups i)]
+                                (when-not (aget seen g)
+                                  (aset seen g true)
+                                  (aset out g (aget data (+ off (aget local-rows i)))))))
+                            (I64Column. out n-groups 0 (.has-nulls c)))
+                          :f64
+                          (let [^F64Column c kc
+                                ^doubles data (.data c)
+                                off (.offset c)
+                                out (double-array n-groups)]
+                            (dotimes [i n-local]
+                              (let [g (aget row-groups i)]
+                                (when-not (aget seen g)
+                                  (aset seen g true)
+                                  (aset out g (aget data (+ off (aget local-rows i)))))))
+                            (F64Column. out n-groups 0 (.has-nulls c)))
+                          (:sym :str)
+                          (let [^objects data (.data kc)
+                                off (.offset kc)
+                                out (object-array n-groups)]
+                            (dotimes [i n-local]
+                              (let [g (aget row-groups i)]
+                                (when-not (aget seen g)
+                                  (aset seen g true)
+                                  (aset out g (aget data (+ off (aget local-rows i)))))))
+                            (if (= tag :sym)
+                              (SymColumn. out n-groups 0 (col/-has-nulls? kc))
+                              (StrColumn. out n-groups 0 (col/-has-nulls? kc))))
+                          (throw (IllegalArgumentException. (str "Bad key type: " tag))))))
+                   key-cols)
+              result-agg-cols
+              (mapv (fn [{:keys [agg col]}]
+                      (let [val-col (tbl/col table col)
+                            tag (col/-type-tag val-col)]
+                        (case tag
+                          :i64
+                          (case agg
+                            :sum (let [^longs s (long-array n-groups)]
+                                   (dotimes [i n-local]
+                                     (let [g (aget row-groups i)
+                                           v (col/-get-long val-col (aget local-rows i))]
+                                       (aset s g (unchecked-add (aget s g) v))))
+                                   (I64Column. s n-groups 0 false))
+                            :count (let [^longs c (long-array n-groups)]
+                                     (dotimes [i n-local]
+                                       (let [g (aget row-groups i)]
+                                         (aset c g (unchecked-inc (aget c g)))))
+                                     (I64Column. c n-groups 0 false))
+                            :min (let [^longs m (long-array n-groups)]
+                                   (java.util.Arrays/fill m Long/MAX_VALUE)
+                                   (dotimes [i n-local]
+                                     (let [g (aget row-groups i)
+                                           v (col/-get-long val-col (aget local-rows i))]
+                                       (aset m g (min (aget m g) v))))
+                                   (I64Column. m n-groups 0 false))
+                            :max (let [^longs mx (long-array n-groups)]
+                                   (java.util.Arrays/fill mx Long/MIN_VALUE)
+                                   (dotimes [i n-local]
+                                     (let [g (aget row-groups i)
+                                           v (col/-get-long val-col (aget local-rows i))]
+                                       (aset mx g (max (aget mx g) v))))
+                                   (I64Column. mx n-groups 0 false))
+                            :avg (let [^longs s (long-array n-groups)
+                                       ^longs c (long-array n-groups)]
+                                   (dotimes [i n-local]
+                                     (let [g (aget row-groups i)
+                                           v (col/-get-long val-col (aget local-rows i))]
+                                       (aset s g (unchecked-add (aget s g) v))
+                                       (aset c g (unchecked-inc (aget c g)))))
+                                   (let [out (double-array n-groups)]
+                                     (dotimes [j n-groups]
+                                       (let [cnt (aget c j)]
+                                         (aset out j (if (zero? cnt) Double/NaN
+                                                         (/ (double (aget s j)) (double cnt))))))
+                                     (F64Column. out n-groups 0 false))))
+                          :f64
+                          (case agg
+                            :sum (let [^doubles s (double-array n-groups)]
+                                   (dotimes [i n-local]
+                                     (let [g (aget row-groups i)
+                                           v (col/-get-double val-col (aget local-rows i))]
+                                       (aset s g (+ (aget s g) v))))
+                                   (F64Column. s n-groups 0 false))
+                            :count (let [^longs c (long-array n-groups)]
+                                     (dotimes [i n-local]
+                                       (let [g (aget row-groups i)]
+                                         (aset c g (unchecked-inc (aget c g)))))
+                                     (I64Column. c n-groups 0 false))
+                            :min (let [^doubles m (double-array n-groups)]
+                                   (java.util.Arrays/fill m Double/MAX_VALUE)
+                                   (dotimes [i n-local]
+                                     (let [g (aget row-groups i)
+                                           v (col/-get-double val-col (aget local-rows i))]
+                                       (aset m g (min (aget m g) v))))
+                                   (F64Column. m n-groups 0 false))
+                            :max (let [^doubles mx (double-array n-groups)]
+                                   (java.util.Arrays/fill mx (- Double/MAX_VALUE))
+                                   (dotimes [i n-local]
+                                     (let [g (aget row-groups i)
+                                           v (col/-get-double val-col (aget local-rows i))]
+                                       (aset mx g (max (aget mx g) v))))
+                                   (F64Column. mx n-groups 0 false))
+                            :avg (let [^doubles s (double-array n-groups)
+                                       ^longs c (long-array n-groups)]
+                                   (dotimes [i n-local]
+                                     (let [g (aget row-groups i)
+                                           v (col/-get-double val-col (aget local-rows i))]
+                                       (aset s g (+ (aget s g) v))
+                                       (aset c g (unchecked-inc (aget c g)))))
+                                   (let [out (double-array n-groups)]
+                                     (dotimes [j n-groups]
+                                       (let [cnt (aget c j)]
+                                         (aset out j (if (zero? cnt) Double/NaN
+                                                         (/ (aget s j) (double cnt))))))
+                                     (F64Column. out n-groups 0 false))))
+                          (throw (IllegalArgumentException. (str "Bad val type: " tag))))))
+                    aggs)]
+          [(vec (concat (mapv #(tbl/col-name table (tbl/col-idx table %)) key-names)
+                        (mapv :out aggs)))
+           (vec (concat result-key-cols result-agg-cols))])))))
+
+(defn parallel-group-by
+  "Parallel radix-partitioned group-by.
+   Partitions rows by radix bits of the combined key hash,
+   then processes each partition independently in core.async threads.
+   Results are concatenated — no merging needed since partitions are disjoint.
+   
+   Usage: (parallel-group-by table :keys [:region] :aggs [{:agg :sum :col :amount :out :total}])
+   
+   Options:
+     :n-threads — number of worker threads (default 4)"
+  [table & {:keys [keys aggs n-threads]
+            :or {n-threads DEFAULT-PARALLELISM}}]
+  (let [key-cols (mapv #(tbl/col table %) keys)
+        _ (assert (seq key-cols) "At least one key column required")
+        nrows (col/-len (first key-cols))
+        _ (doseq [kc (rest key-cols)]
+            (assert (= nrows (col/-len kc)) "All key columns must have same length"))]
+    (if (zero? nrows)
+      (tbl/table [] [])
+      (let [nkeys   (count key-cols)
+            rbits   (radix-bits n-threads)
+            n-parts (bit-shift-left 1 rbits)
+            mask    (unchecked-dec n-parts)
+            prehashes (object-array nkeys)]
+        (dotimes [k nkeys]
+          (aset prehashes k (prehash-column (nth key-cols k))))
+        (let [part-rows (object-array n-parts)]
+          (dotimes [p n-parts] (aset part-rows p (java.util.ArrayList.)))
+          (dotimes [row nrows]
+            (let [combined (loop [k 0, ch (long 0)]
+                             (if (< k nkeys)
+                               (let [kh (aget ^longs (aget prehashes k) row)]
+                                 (recur (unchecked-inc k)
+                                        (if (zero? k) kh (h/hash-combine ch kh))))
+                               ch))
+                  part (bit-and combined mask)]
+              (.add ^java.util.ArrayList (aget part-rows part)
+                    (long-array [row combined]))))
+          (let [result-chan (a/chan n-parts)
+                active (volatile! 0)]
+            (dotimes [p n-parts]
+              (let [^java.util.ArrayList rows (aget part-rows p)
+                    n-local (.size rows)]
+                (when (pos? n-local)
+                  (vswap! active inc)
+                  (a/thread
+                    (let [cap (h/ht-capacity n-local)
+                          local-rows (long-array n-local)
+                          local-hashes (long-array n-local)]
+                      (dotimes [i n-local]
+                        (let [pair ^longs (.get rows i)]
+                          (aset local-rows i (aget pair 0))
+                          (aset local-hashes i (aget pair 1))))
+                      (let [result (partition-local-group-by key-cols (vec keys) table aggs
+                                      local-rows local-hashes n-local cap)]
+                        (a/>!! result-chan result)))))))
+            (let [active-count @active]
+              (loop [remaining active-count
+                     acc-schema nil
+                     acc-cols nil]
+                (if (zero? remaining)
+                  (if acc-schema
+                    (tbl/table acc-schema acc-cols)
+                    (tbl/table (vec (concat (vec keys) (mapv :out aggs)))
+                               (vec (repeat (+ (count keys) (count aggs))
+                                            (I64Column. (long-array 0) 0 0 false)))))
+                  (let [result (a/<!! result-chan)]
+                    (if result
+                      (let [[schema2 cols2] result]
+                        (if (nil? acc-schema)
+                          (recur (dec remaining) schema2 cols2)
+                          (let [merged-cols
+                                (mapv (fn [acc-col part-col]
+                                        (let [tag (col/-type-tag acc-col)
+                                              n-acc (col/-len acc-col)
+                                              n-part (col/-len part-col)
+                                              n-new (unchecked-add n-acc n-part)]
+                                          (if (zero? n-part)
+                                            acc-col
+                                            (case tag
+                                              :i64
+                                              (let [data (long-array n-new)]
+                                                (System/arraycopy (.data ^I64Column acc-col) (.offset ^I64Column acc-col) data 0 n-acc)
+                                                (System/arraycopy (.data ^I64Column part-col) (.offset ^I64Column part-col) data n-acc n-part)
+                                                (I64Column. data n-new 0 false))
+                                              :f64
+                                              (let [data (double-array n-new)]
+                                                (System/arraycopy (.data ^F64Column acc-col) (.offset ^F64Column acc-col) data 0 n-acc)
+                                                (System/arraycopy (.data ^F64Column part-col) (.offset ^F64Column part-col) data n-acc n-part)
+                                                (F64Column. data n-new 0 false))
+                                              (:sym :str)
+                                              (let [data (object-array n-new)]
+                                                (System/arraycopy (.data acc-col) (.offset acc-col) data 0 n-acc)
+                                                (System/arraycopy (.data part-col) (.offset part-col) data n-acc n-part)
+                                                (if (= tag :sym)
+                                                  (SymColumn. data n-new 0 false)
+                                                  (StrColumn. data n-new 0 false)))
+                                              (throw (IllegalArgumentException. (str "Bad merge type: " tag)))))))
+                                      acc-cols cols2)]
+                            (recur (dec remaining) schema2 merged-cols))))
+                      (recur (dec remaining) acc-schema acc-cols)))))))))))
+
+
+)
 ;; ════════════════════════════════════════════════════════════════════════
 ;; Pivot (cross-tabulation)
 ;; ════════════════════════════════════════════════════════════════════════
