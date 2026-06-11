@@ -25,7 +25,8 @@ Add the git dependency to your `deps.edn`:
                              :git/sha "838c4a4b8d68378cf51897ba03ed93e1ff0b9921"}}
 ```
 
-It depends on Clojure 1.12.0 and core.async 1.6.681.
+It depends on Clojure 1.12.0 and core.async 1.6.681, and requires JDK 18+
+(the hash kernels use `Math/unsignedMultiplyHigh`); CI runs on 21 and 25.
 
 ## Concepts
 
@@ -58,11 +59,13 @@ A **Table** is a schema (vector of keyword column names) plus a vector of column
 
 The `where` macro builds a boolean mask by comparing a column against a constant, combines masks for compound predicates with `and`, `or`, and `not`, then materializes the rows that pass into a new table. A three-level selection bitmap lives in `flatiron.selection` as a lower-level primitive for callers that want to track which rows are alive without materializing, but the built-in `where` materializes eagerly.
 
+For filter-then-aggregate pipelines, `flatiron.group/group-by` and `parallel-group-by` accept the mask directly via a `:where` option and gather only the key and aggregate columns through it, skipping the intermediate table entirely.
+
 ### Morsel engine
 
-Named after the Rayforce concept of a "morsel" (a bite-sized piece of data). All compute operations follow the same pattern: create a morsel source from a column, then pull 1024-row batches through it. Within each batch, the loop body runs over raw primitive arrays with no protocol dispatch.
+Named after the Rayforce concept of a "morsel" (a bite-sized piece of data). Element-wise operations (arithmetic, comparisons) create a morsel source from a column and pull 1024-row batches through it; within each batch, the loop body runs over raw primitive arrays with no protocol dispatch.
 
-This gives you the abstraction of typed generic operations with the performance of hand-written primitive loops.
+Aggregations and group-by go one step further: they read the column's backing array directly in type-specialized loops, falling back to the morsel layer only where the indirection is needed. Either way you get the abstraction of typed generic operations with the performance of hand-written primitive loops.
 
 ## The DSL
 
@@ -98,15 +101,15 @@ Supported predicates: `>`, `<`, `>=`, `<=`, `=`, `not=`, combined with `and`, `o
 
 ## Aggregation functions
 
-All aggregations are single-pass morsel reductions. They dispatch on column type once, then loop over primitive arrays with unchecked arithmetic.
+All aggregations are single-pass reductions that dispatch on column type once, then loop directly over the backing primitive arrays with unchecked arithmetic.
 
 | Function | Description |
 |----------|-------------|
 | `sum` | Sum of values, skips nulls |
 | `count` | Count of non-null values |
-| `avg` | Arithmetic mean, skips nulls |
-| `min` | Minimum value |
-| `max` | Maximum value |
+| `avg` | Arithmetic mean, skips nulls; null for groups with no non-null values |
+| `min` | Minimum value, skips nulls; null for groups with no non-null values |
+| `max` | Maximum value, skips nulls; null for groups with no non-null values |
 
 ## Sorting and window functions
 
@@ -116,7 +119,7 @@ Sorting uses `java.util.TimSort` on an index array — the column data is never 
 (require '[flatiron.sort :as sort])
 (require '[flatiron.window :as win])
 
-(let [sorted (sort/sort-by table :Qty :asc)]
+(let [sorted (sort/sort-table table [[:Qty :asc]])]
   (win/row-number sorted))  ;; => I64Column [1 2 3 4 5]
 ```
 
@@ -129,16 +132,18 @@ Window functions operate on sorted columns:
 
 ## Parallel execution
 
-CPU-bound aggregations can run across multiple threads using core.async. Each thread processes an independent slice of rows using the same morsel engine, and results are merged at the end.
+The main parallel entry point is `flatiron.group/parallel-group-by`: it radix-partitions rows by the high bits of the key hash and runs the hash, histogram, scatter, and per-partition grouping phases on a shared ForkJoin pool. Partitions are disjoint, so results concatenate without a merge step, and output is identical to the single-threaded `group-by`.
 
 ```clojure
-(require '[flatiron.parallel :as par])
+(require '[flatiron.group :as g])
 
-(par/parallel-i64-sum qty-col 4)     ;; sum across 4 threads
-(par/parallel-group-by table :keys [:Region] :aggs ...)  ;; parallel group-by
+(g/parallel-group-by table
+  :keys [:Region]
+  :aggs [{:agg :sum :col :Qty :out :total}]
+  :n-threads 8)
 ```
 
-The parallelism is transparent — you get the same result as single-threaded, just faster on large datasets.
+`flatiron.parallel` additionally provides per-column parallel primitives (`parallel-i64-sum`, `parallel-i64-min`, parallel filter counts, and so on) built on core.async threads. Parallelism pays off when there's enough work per row — a plain scalar sum is memory-bandwidth-bound and runs as fast single-threaded.
 
 ## Graph algorithms
 
@@ -169,11 +174,15 @@ Available algorithms:
 
 The CSV reader does type inference by sampling the first 100 rows, then reads into typed columns. It handles a wide range of types automatically.
 
+`read-csv` takes the CSV content as a string or `Reader` (not a file path):
+
 ```clojure
 (require '[flatiron.io :as io])
+(require '[clojure.java.io :as jio])
 
-(let [table (io/read-csv "data/trades.csv")]
-  (select table :Symbol (sum :Qty)))
+(with-open [r (jio/reader "data/trades.csv")]
+  (let [table (io/read-csv r)]
+    (select table :Symbol (sum :Qty))))
 ```
 
 The writer outputs a table back to CSV.
@@ -212,20 +221,26 @@ of 10 runs after warmup.
 clojure -M:bench -m flatiron.rayforce-bench [path-to-rayforce-binary]
 ```
 
-Results on an Apple M1 Max (JDK 26, Rayforce `make release`), 1M rows:
+Results on an Apple M1 Max (JDK 26, Rayforce `make release`), 1M rows.
+The *flatiron* column is the single-threaded path; *flatiron par8* is the
+parallel path run with `:n-threads 8` (`parallel-group-by` for the group-by
+queries, `parallel-i64-sum` for the scalar sum). Rayforce parallelizes
+internally with its own worker pool.
 
 | query                            | rayforce (C) | flatiron | flatiron par8 |
 |----------------------------------|-------------:|---------:|--------------:|
-| group-by Sym (100 groups), sum   |      0.91 ms | 21.6 ms  |       8.8 ms  |
-| group-by Sym, sum+count+avg      |      1.43 ms | 23.0 ms  |       8.6 ms  |
-| where Qty>500, group-by Sym sum  |      0.50 ms | 14.4 ms  |       7.1 ms  |
-| group-by Id (100K groups), sum   |      2.66 ms | 32.4 ms  |       7.4 ms  |
-| scalar sum, 1M i64               |      0.07 ms |  0.7 ms  |          —    |
+| group-by Sym (100 groups), sum   |      0.99 ms | 21.5 ms  |       6.7 ms  |
+| group-by Sym, sum+count+avg      |      1.34 ms | 23.9 ms  |      11.5 ms  |
+| where Qty>500, group-by Sym sum  |      0.45 ms | 14.8 ms  |       7.2 ms  |
+| group-by Id (100K groups), sum   |      2.83 ms | 33.2 ms  |       8.4 ms  |
+| scalar sum, 1M i64               |      0.05 ms |  0.7 ms  |       1.0 ms  |
 
 The C implementation is 3–10x faster than Flatiron's parallel path (it uses
 SIMD kernels, a custom allocator, and saturates memory bandwidth on scans).
 Flatiron's goal is to stay within an order of magnitude of C while remaining
-pure Clojure.
+pure Clojure. The scalar sum is the cautionary row: it's memory-bandwidth
+bound, so the parallel version loses to the single-threaded loop — thread
+dispatch costs more than it saves.
 
 ## Acknowledgments
 

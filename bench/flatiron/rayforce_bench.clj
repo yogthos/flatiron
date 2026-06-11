@@ -18,6 +18,7 @@
             [flatiron.column :as col]
             [flatiron.filter :as filt]
             [flatiron.group :as g]
+            [flatiron.parallel :as par]
             [flatiron.table :as tbl]))
 
 (set! *warn-on-reflection* true)
@@ -150,7 +151,8 @@
                         :aggs [{:agg :sum :col :Qty :out :total}])]
      ["Q4p" #(g/parallel-group-by table :keys [:Id] :n-threads 8
                                   :aggs [{:agg :sum :col :Qty :out :total}])]
-     ["Q5" #(agg/i64-sum qty-col)]]))
+     ["Q5" #(agg/i64-sum qty-col)]
+     ["Q5p" #(par/parallel-i64-sum qty-col 8)]]))
 
 ;; ── Main ──────────────────────────────────────────────────────────────
 
