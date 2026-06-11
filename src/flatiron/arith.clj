@@ -25,7 +25,7 @@
     (loop [dst-off 0]
       (let [cnt (long (m/morsel-next-i64! ms buf 0 m/MORSEL-SIZE))]
         (if (zero? cnt)
-          (I64Column. out n 0 has-n)
+          (I64Column. out n 0 has-n nil)
           (do
             (if has-n
               (dotimes [i cnt]
@@ -49,7 +49,7 @@
     (loop [dst-off 0]
       (let [cnt (long (m/morsel-next-i64! ms buf 0 m/MORSEL-SIZE))]
         (if (zero? cnt)
-          (I64Column. out n 0 has-n)
+          (I64Column. out n 0 has-n nil)
           (do
             (if has-n
               (dotimes [i cnt]
@@ -76,7 +76,7 @@
     (loop [dst-off 0]
       (let [cnt (long (m/morsel-next-f64! ms buf 0 m/MORSEL-SIZE))]
         (if (zero? cnt)
-          (F64Column. out n 0 has-n)
+          (F64Column. out n 0 has-n nil)
           (do
             (if has-n
               (dotimes [i cnt]
@@ -99,7 +99,7 @@
     (loop [dst-off 0]
       (let [cnt (long (m/morsel-next-f64! ms buf 0 m/MORSEL-SIZE))]
         (if (zero? cnt)
-          (F64Column. out n 0 has-n)
+          (F64Column. out n 0 has-n nil)
           (do
             (dotimes [i cnt]
               (aset out (+ dst-off i) (Math/abs (aget buf i))))
@@ -127,7 +127,7 @@
             b-cnt (long (m/morsel-next-i64! bms bbuf 0 m/MORSEL-SIZE))]
         (assert (= a-cnt b-cnt) "Column length mismatch")
         (if (zero? a-cnt)
-          (I64Column. out n 0 has-n)
+          (I64Column. out n 0 has-n nil)
           (do
             (if has-n
               (dotimes [i a-cnt]
@@ -163,7 +163,7 @@
             b-cnt (long (m/morsel-next-i64! bms bbuf 0 m/MORSEL-SIZE))]
         (assert (= a-cnt b-cnt) "Column length mismatch")
         (if (zero? a-cnt)
-          (F64Column. out n 0 has-n)
+          (F64Column. out n 0 has-n nil)
           (do
             (if has-n
               (dotimes [i a-cnt]
@@ -202,7 +202,7 @@
             b-cnt (long (m/morsel-next-f64! bms bbuf 0 m/MORSEL-SIZE))]
         (assert (= a-cnt b-cnt) "Column length mismatch")
         (if (zero? a-cnt)
-          (F64Column. out n 0 has-n)
+          (F64Column. out n 0 has-n nil)
           (do
             (if has-n
               (dotimes [i a-cnt]
@@ -237,7 +237,7 @@
             b-cnt (long (m/morsel-next-f64! bms bbuf 0 m/MORSEL-SIZE))]
         (assert (= a-cnt b-cnt) "Column length mismatch")
         (if (zero? a-cnt)
-          (F64Column. out n 0 has-n)
+          (F64Column. out n 0 has-n nil)
           (do
             (if has-n
               (dotimes [i a-cnt]

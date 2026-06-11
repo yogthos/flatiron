@@ -120,7 +120,7 @@
         (dotimes [i nn] (aset rank i (aget rank2 i)))))
     (let [nc (long-array nn) rc (double-array nn)]
       (dotimes [i nn] (aset nc i i) (aset rc i (aget rank i)))
-      (tbl/table [:node :rank] [(I64Column. nc nn 0 false) (F64Column. rc nn 0 false)]))))
+      (tbl/table [:node :rank] [(I64Column. nc nn 0 false nil) (F64Column. rc nn 0 false nil)]))))
 
 (defn page-rank
   "PageRank with positional arguments, matching the README:
@@ -146,8 +146,8 @@
           (do (aset vc i col/NULL_I64) (vreset! hn true))
           (aset vc i v))))
     (tbl/table [:node value-name]
-               [(I64Column. nc nn 0 false)
-                (I64Column. vc nn 0 @hn)])))
+               [(I64Column. nc nn 0 false nil)
+                (I64Column. vc nn 0 @hn nil)])))
 
 (defn bfs
   "Breadth-first search from `start`. Returns a table of [:node :distance]
@@ -255,8 +255,8 @@
             (do (aset dc i Double/NaN) (vreset! hn true))
             (aset dc i d))))
       (tbl/table [:node :distance]
-                 [(I64Column. nc nn 0 false)
-                  (F64Column. dc nn 0 @hn)]))))
+                 [(I64Column. nc nn 0 false nil)
+                  (F64Column. dc nn 0 @hn nil)]))))
 
 (defn connected-components [^Graph g]
   (let [nn (.n-nodes g)
@@ -282,4 +282,4 @@
           (recur @ch))))
     (let [nc (long-array nn) cc (long-array nn)]
       (dotimes [i nn] (aset nc i i) (aset cc i (aget label i)))
-      (tbl/table [:node :component] [(I64Column. nc nn 0 false) (I64Column. cc nn 0 false)]))))
+      (tbl/table [:node :component] [(I64Column. nc nn 0 false nil) (I64Column. cc nn 0 false nil)]))))

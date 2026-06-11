@@ -59,10 +59,20 @@
                       (recur (unchecked-inc i))))
                   (finally (.close out)))
                 (recur (unchecked-inc c))))))
-        (let [col-names (mapv #(aget schema %) (range nc))]
+        (let [col-names (mapv #(aget schema %) (range nc))
+              ;; Logical types are recorded only in the metadata; the binary
+              ;; files already hold the codec-encoded primitives (i64 columns
+              ;; are written via -get-long, which returns the raw value).
+              logical   (into {}
+                              (keep (fn [i]
+                                      (let [c  (aget ^objects (.columns table) i)
+                                            lg (col/-logical-tag c)]
+                                        (when lg [(aget schema i) lg])))
+                                    (range nc)))]
           (spit (str dir "/_meta.edn")
-                (pr-str {:schema col-names
-                         :nrows (if (pos? nc) (col/-len (aget ^objects (.columns table) 0)) 0)}))))
+                (pr-str (cond-> {:schema col-names
+                                 :nrows (if (pos? nc) (col/-len (aget ^objects (.columns table) 0)) 0)}
+                          (seq logical) (assoc :logical logical))))))
       dir)))
 
 ;; ── Load ──────────────────────────────────────────────────────────────
@@ -81,13 +91,13 @@
                   (when (< i nr)
                     (aset data i (.readLong in))
                     (recur (unchecked-inc i))))
-                (I64Column. data nr 0 has-nulls))
+                (I64Column. data nr 0 has-nulls nil))
             2 (let [data (double-array nr)]
                 (loop [i 0]
                   (when (< i nr)
                     (aset data i (.readDouble in))
                     (recur (unchecked-inc i))))
-                (F64Column. data nr 0 has-nulls))
+                (F64Column. data nr 0 has-nulls nil))
             3 (let [data (byte-array nr)]
                 (loop [i 0]
                   (when (< i nr)
@@ -111,8 +121,8 @@
             (throw (IllegalArgumentException. (str "Unknown tag: " tag))))
           ;; nr=0 → empty column of appropriate type
           (case tag
-            1 (I64Column. (long-array 0) 0 0 false)
-            2 (F64Column. (double-array 0) 0 0 false)
+            1 (I64Column. (long-array 0) 0 0 false nil)
+            2 (F64Column. (double-array 0) 0 0 false nil)
             3 (BoolColumn. (byte-array 0) 0 0)
             4 (SymColumn. (object-array 0) 0 0 false)
             5 (StrColumn. (object-array 0) 0 0 false)
@@ -124,16 +134,20 @@
     (let [d (str dir)
           meta (read-string (slurp (str d "/_meta.edn")))
           schema (:schema meta)
+          logical (:logical meta)
           nc (count schema)]
       (if (zero? nc)
         (tbl/table [] [])
         (let [cols
               (loop [c 0 acc (transient [])]
                 (if (< c nc)
-                  (let [col-name (name (nth schema c))
-                        f (File. d (str "col_" col-name))]
+                  (let [col-nm (nth schema c)
+                        f (File. d (str "col_" (name col-nm)))]
                     (if (.exists f)
-                      (recur (unchecked-inc c) (conj! acc (read-column f)))
+                      (let [raw (read-column f)
+                            lg  (get logical col-nm)
+                            col (if lg (col/with-logical raw lg) raw)]
+                        (recur (unchecked-inc c) (conj! acc col)))
                       (throw (Exception. (str "Missing column file: " f)))))
                   (persistent! acc)))]
           (tbl/table (vec schema) (vec cols)))))))

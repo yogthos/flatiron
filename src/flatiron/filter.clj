@@ -7,7 +7,8 @@
    in a predicate does not need to match the column type (an integer literal
    compared against an F64 column is coerced to double, and so on)."
   (:require [flatiron.column :as col]
-            [flatiron.table :as tbl])
+            [flatiron.table :as tbl]
+            [flatiron.types :as types])
   (:import [flatiron.column I64Column F64Column BoolColumn SymColumn StrColumn]))
 
 (set! *warn-on-reflection* true)
@@ -34,7 +35,10 @@
             ^longs data (.data c)
             offset (.offset c)
             hn     (.has-nulls c)
-            v      (long val)
+            lg     (.logical c)
+            ;; encode a domain literal (e.g. a LocalDate) to its raw long once,
+            ;; outside the row loop, so the comparison stays a primitive op.
+            v      (long (if (and lg (not (number? val))) (types/encode lg val) val))
             code   (op-code op)]
         (loop [i (int 0)]
           (when (< i n)
@@ -50,7 +54,8 @@
       (let [^F64Column c col
             ^doubles data (.data c)
             offset (.offset c)
-            v      (double val)
+            lg     (.logical c)
+            v      (double (if (and lg (not (number? val))) (types/encode lg val) val))
             code   (op-code op)]
         (loop [i (int 0)]
           (when (< i n)
@@ -146,14 +151,14 @@
             offset (.offset c)
             dst (long-array k)]
         (dotimes [i k] (aset dst i (aget src (+ offset (aget idx i)))))
-        (I64Column. dst k 0 (.has-nulls c)))
+        (col/i64-like c dst k))
       :f64
       (let [^F64Column c col
             ^doubles src (.data c)
             offset (.offset c)
             dst (double-array k)]
         (dotimes [i k] (aset dst i (aget src (+ offset (aget idx i)))))
-        (F64Column. dst k 0 (.has-nulls c)))
+        (col/f64-like c dst k))
       :sym
       (let [^SymColumn c col
             ^objects src (.data c)
