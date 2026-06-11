@@ -21,8 +21,8 @@ The morsel engine processes data in 1024-row batches. This amortizes the cost of
 Add the git dependency to your `deps.edn`:
 
 ```clojure
-{io.github.yogthos/flatiron {:git/tag "v0.1.0"
-                             :git/sha "838c4a4b8d68378cf51897ba03ed93e1ff0b9921"}}
+{io.github.yogthos/flatiron {:git/tag "v0.2.0"
+                             :git/sha "98d700ee79b5425cd837db5b7866a69cf4a0f432"}}
 ```
 
 It depends on Clojure 1.12.0 and core.async 1.6.681, and requires JDK 18+
