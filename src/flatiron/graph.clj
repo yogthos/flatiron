@@ -258,28 +258,36 @@
                  [(I64Column. nc nn 0 false nil)
                   (F64Column. dc nn 0 @hn nil)]))))
 
-(defn connected-components [^Graph g]
+(defn connected-components
+  "The undirected components of the graph, via BFS flood fill over forward
+   and reverse adjacency: O(V+E), one traversal per component. Replaces
+   sweep-based label propagation, which needs one pass per descending hop
+   and degrades quadratically on long paths."
+  [^Graph g]
   (let [nn (.n-nodes g)
         ^longs fo (.fwd-offsets g) ^longs ft (.fwd-targets g)
         ^longs ro (.rev-offsets g) ^longs rt (.rev-targets g)
         label (long-array nn)]
-    (dotimes [i nn] (aset label i i))
-    (loop [changed true]
-      (when changed
-        (let [ch (volatile! false)]
-          (dotimes [v nn]
-            (let [ml (volatile! (aget label v))]
-              (loop [j (aget fo v)]
-                (when (< j (aget fo (unchecked-inc v)))
-                  (vswap! ml min (aget label (aget ft j)))
-                  (recur (unchecked-inc j))))
-              (loop [j (aget ro v)]
-                (when (< j (aget ro (unchecked-inc v)))
-                  (vswap! ml min (aget label (aget rt j)))
-                  (recur (unchecked-inc j))))
-              (when (< @ml (aget label v))
-                (aset label v (long @ml)) (vreset! ch true))))
-          (recur @ch))))
+    (java.util.Arrays/fill label -1)
+    (dotimes [s nn]
+      (when (== -1 (aget label s))
+        (let [q (java.util.ArrayDeque.)]
+          (.add q (Long/valueOf s))
+          (aset label s s)
+          (loop []
+            (when-not (.isEmpty q)
+              (let [u (long (.poll q))]
+                (let [flood (fn [^longs off ^longs tgt]
+                              (loop [j (aget off u)]
+                                (when (< j (aget off (unchecked-inc u)))
+                                  (let [v (aget tgt j)]
+                                    (when (== -1 (aget label v))
+                                      (aset label v s)
+                                      (.add q (Long/valueOf v))))
+                                  (recur (unchecked-inc j)))))]
+                  (flood fo ft)
+                  (flood ro rt))
+                (recur)))))))
     (let [nc (long-array nn) cc (long-array nn)]
       (dotimes [i nn] (aset nc i i) (aset cc i (aget label i)))
       (tbl/table [:node :component] [(I64Column. nc nn 0 false nil) (I64Column. cc nn 0 false nil)]))))

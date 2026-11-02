@@ -221,3 +221,25 @@
     (doseq [i (range 3)]
       (t/is (= (col/-get-double (tbl/col r1 :rank) i)
                (col/-get-double (tbl/col r2 :rank) i))))))
+
+;; ════════════════════════════════════════════════════════════════════════
+;; Connected components — scaling
+;; ════════════════════════════════════════════════════════════════════════
+
+(t/deftest connected-components-stays-linear-on-a-zigzag-path
+  ;; The path visits ids 0, n-1, 1, n-2, ... so every other hop descends in
+  ;; id order: the worst case for sweep-based label propagation, which needs
+  ;; one full pass per descent. A flood fill must stay O(V+E) regardless.
+  (let [n 16000
+        path (interleave (range (quot n 2)) (range (dec n) (dec (quot n 2)) -1))
+        pairs (partition 2 1 path)
+        gr (g/graph (col/i64-column (mapv (comp long first) pairs))
+                    (col/i64-column (mapv (comp long second) pairs)))
+        t0 (System/nanoTime)
+        r  (g/connected-components gr)
+        cc (tbl/col r :component)
+        ms (/ (- (System/nanoTime) t0) 1.0e6)]
+    (t/is (= n (tbl/nrows r)))
+    (t/is (every? #(== 0 (col/-get-long cc %)) (range n))
+          "the path is a single component whose smallest id is 0")
+    (t/is (< ms 1000) (str "took " ms " ms; must not degrade with diameter"))))
