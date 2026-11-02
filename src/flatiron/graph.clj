@@ -43,26 +43,61 @@
 (defn graph
   "Build a graph from a source and a target I64 column (one edge per row).
    An optional F64 weight column gives per-edge weights. `n-nodes` overrides
-   the inferred node count (otherwise it is max node id + 1)."
+   the inferred node count (otherwise it is max node id + 1).
+
+   Node ids must fall in [0, n-nodes) and weights must be finite and
+   nonnegative; violations throw ex-info (:type :invalid-node-id or
+   :invalid-weight) naming the offending edge. The nonnegative rule is what
+   lets dijkstra terminate on every input, since a negative cycle would
+   relax forever.
+
+   src and dst must be I64 columns of equal length, weight (when given) an
+   F64 column of the same length, and an explicit n-nodes must be nonnegative
+   and below the JVM array-length limit (Integer/MAX_VALUE); violations throw
+   ex-info (:type :invalid-column-type, :length-mismatch, or
+   :invalid-n-nodes)."
   ([src-col dst-col] (graph src-col dst-col nil nil))
   ([src-col dst-col weight-col] (graph src-col dst-col weight-col nil))
   ([src-col dst-col weight-col n-nodes]
+   (when-not (instance? I64Column src-col)
+     (throw (ex-info "src column must be :i64"
+                     {:type :invalid-column-type :column :src
+                      :actual (when src-col (col/-type-tag src-col))})))
+   (when-not (instance? I64Column dst-col)
+     (throw (ex-info "dst column must be :i64"
+                     {:type :invalid-column-type :column :dst
+                      :actual (when dst-col (col/-type-tag dst-col))})))
+   (when (and weight-col (not (instance? F64Column weight-col)))
+     (throw (ex-info "weight column must be :f64"
+                     {:type :invalid-column-type :column :weight
+                      :actual (col/-type-tag weight-col)})))
    (let [^I64Column sc src-col
          ^I64Column dc dst-col
          n-edges (.len sc)
          ^longs sd (.data sc) so (.offset sc)
          ^longs dd (.data dc) do (.offset dc)
          src (long-array n-edges) dst (long-array n-edges)]
+     (when-not (= n-edges (.len dc))
+       (throw (ex-info "src and dst columns must have equal lengths"
+                       {:type :length-mismatch :src-len n-edges :dst-len (.len dc)})))
+     (when (and weight-col (not= n-edges (col/-len weight-col)))
+       (throw (ex-info "weight column must match edge count"
+                       {:type :length-mismatch :edge-count n-edges
+                        :weight-len (col/-len weight-col)})))
      (dotimes [i n-edges]
        (aset src i (aget sd (+ so i)))
        (aset dst i (aget dd (+ do i))))
-     (let [nn (long (or n-nodes
-                        (if (zero? n-edges)
-                          0
-                          (let [mx (volatile! 0)]
-                            (dotimes [i n-edges] (vswap! mx max (aget src i) (aget dst i)))
-                            (unchecked-inc @mx)))))]
-       (dotimes [i n-edges]
+      (let [nn (long (or n-nodes
+                         (if (zero? n-edges)
+                           0
+                           (let [mx (volatile! 0)]
+                             (dotimes [i n-edges] (vswap! mx max (aget src i) (aget dst i)))
+                             (unchecked-inc @mx)))))]
+        (when (or (neg? nn) (>= nn Integer/MAX_VALUE))
+          (throw (ex-info "n-nodes out of range"
+                          {:type :invalid-n-nodes :n-nodes nn
+                           :limit (dec Integer/MAX_VALUE)})))
+        (dotimes [i n-edges]
          (let [s (aget src i) d (aget dst i)]
            (when (or (neg? s) (>= s nn) (neg? d) (>= d nn))
              (throw (ex-info "node id out of range"
@@ -101,15 +136,30 @@
            (tbl/col table :weight)
            n-nodes)))
 
-(defn degree [^Graph g ^long n]
+(defn- check-node-index [^Graph g ^long n]
+  (when (or (neg? n) (>= n (.n-nodes g)))
+    (throw (ex-info "node index out of range"
+                    {:type :invalid-node-index :node n :n-nodes (.n-nodes g)}))))
+
+(defn degree
+  "Out-degree of node n. Throws ex-info if n is outside [0, n-nodes)."
+  [^Graph g ^long n]
+  (check-node-index g n)
   (let [^longs off (.fwd-offsets g)]
     (unchecked-subtract (aget off (unchecked-inc n)) (aget off n))))
 
-(defn in-degree [^Graph g ^long n]
+(defn in-degree
+  "In-degree of node n. Throws ex-info if n is outside [0, n-nodes)."
+  [^Graph g ^long n]
+  (check-node-index g n)
   (let [^longs off (.rev-offsets g)]
     (unchecked-subtract (aget off (unchecked-inc n)) (aget off n))))
 
-(defn neighbors [^Graph g ^long n]
+(defn neighbors
+  "Lazy seq of [target weight] pairs for node n. Weights default to 1.0 when
+   the graph is unweighted. Throws ex-info if n is outside [0, n-nodes)."
+  [^Graph g ^long n]
+  (check-node-index g n)
   (let [^longs off (.fwd-offsets g) ^longs tgt (.fwd-targets g)
         ^doubles wts (.weights g) start (aget off n) end (aget off (unchecked-inc n))]
     (for [i (range start end)]
@@ -234,8 +284,11 @@
 
 (defn dijkstra
   "Single-source shortest paths from `start` over edge weights. Edges without
-   weights count as weight 1.0. Returns a table of [:node :distance]; nodes
-   that are unreachable have null distance."
+   weights count as weight 1.0. Requires nonnegative weights, which `graph`
+   enforces at construction; a negative cycle would otherwise never settle.
+   Throws ex-info (:type :distance-overflow) if a path distance exceeds the
+   double range. Returns a table of [:node :distance]; nodes that are
+   unreachable have null distance."
   [^Graph g ^long start]
   (let [nn (.n-nodes g)
         ^longs fo (.fwd-offsets g)
@@ -257,15 +310,19 @@
                   u   (long (nth top 1))]
               ;; Skip stale heap entries left behind by a relaxation.
               (when (<= d (aget dist u))
-                (loop [j (aget fo u)]
-                  (when (< j (aget fo (unchecked-inc u)))
-                    (let [v  (aget ft j)
-                          w  (if wts (aget wts j) 1.0)
-                          nd (+ d w)]
-                      (when (< nd (aget dist v))
-                        (aset dist v nd)
-                        (.add pq [nd v])))
-                    (recur (unchecked-inc j))))))
+                  (loop [j (aget fo u)]
+                    (when (< j (aget fo (unchecked-inc u)))
+                      (let [v  (aget ft j)
+                            w  (if wts (aget wts j) 1.0)
+                            nd (+ d w)]
+                        (when (Double/isInfinite nd)
+                          (throw (ex-info "shortest-path distance overflow"
+                                          {:type :distance-overflow :node v
+                                           :via u :dist d :weight w})))
+                        (when (< nd (aget dist v))
+                          (aset dist v nd)
+                          (.add pq [nd v])))
+                      (recur (unchecked-inc j))))))
             (recur)))))
     (let [nc (long-array nn)
           dc (double-array nn)

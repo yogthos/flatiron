@@ -167,11 +167,13 @@
                           (g/graph (col/i64-column [0]) (col/i64-column [1]) nil 1))))
 
 (t/deftest graph-rejects-negative-weights
-  "A negative two-node cycle used to livelock dijkstra; rejected at build."
+  "Dijkstra requires nonnegative weights. The cycle 0->1 at 0.5 plus 1->0 at
+   -1.0 totals -0.5, and a negative cycle never settles, so construction
+   rejects negative weights outright."
   (t/is (thrown-with-msg? Exception #"weight"
                           (g/graph (col/i64-column [0 1])
                                    (col/i64-column [1 0])
-                                   (col/f64-column [1.0 -1.0])))))
+                                   (col/f64-column [0.5 -1.0])))))
 
 (t/deftest graph-rejects-non-finite-weights
   (doseq [w [##NaN ##Inf ##-Inf]]
@@ -197,6 +199,53 @@
     (t/is (thrown-with-msg? Exception #":dst" (g/build-graph tb)))
     (t/is (= :dst (:column (try (g/build-graph tb)
                                 (catch Exception e (ex-data e))))))))
+
+;; ════════════════════════════════════════════════════════════════════════
+;; Pre-existing input-validation gaps
+;; ════════════════════════════════════════════════════════════════════════
+
+(t/deftest graph-rejects-mismatched-lengths
+  (t/is (thrown-with-msg? Exception #"equal lengths"
+                          (g/graph (col/i64-column [0 1]) (col/i64-column [1]))))
+  (t/is (thrown-with-msg? Exception #"weight column must match"
+                          (g/graph (col/i64-column [0 1]) (col/i64-column [1 2])
+                                   (col/f64-column [1.0])))))
+
+(t/deftest graph-rejects-wrong-column-types
+  (t/is (thrown-with-msg? Exception #"src column must be :i64"
+                          (g/graph (col/str-column ["a"]) (col/i64-column [0]))))
+  (t/is (thrown-with-msg? Exception #"dst column must be :i64"
+                          (g/graph (col/i64-column [0]) (col/str-column ["b"]))))
+  (t/is (thrown-with-msg? Exception #"weight column must be :f64"
+                          (g/graph (col/i64-column [0]) (col/i64-column [1])
+                                   (col/i64-column [5])))))
+
+(t/deftest graph-rejects-bad-explicit-n-nodes
+  (t/is (thrown-with-msg? Exception #"n-nodes out of range"
+                          (g/graph (col/i64-column []) (col/i64-column []) nil -5)))
+  (t/is (thrown-with-msg? Exception #"n-nodes out of range"
+                          (g/graph (col/i64-column [0]) (col/i64-column [1])
+                                   nil Long/MAX_VALUE))))
+
+(t/deftest accessors-reject-out-of-range-nodes
+  (let [gr (g/graph (col/i64-column [0 1]) (col/i64-column [1 0]))]
+    (doseq [f [g/degree g/in-degree g/neighbors]]
+      (t/is (thrown-with-msg? Exception #"node index out of range" (f gr 2)))
+      (t/is (thrown-with-msg? Exception #"node index out of range" (f gr -1))))))
+
+(t/deftest dijkstra-rejects-distance-overflow
+  ;; Both weights are finite, but two hops of 1e308 overflow the double
+  ;; range. The old behavior silently reported node 2 as unreachable.
+  (let [gr (g/graph (col/i64-column [0 1 2]) (col/i64-column [1 2 0])
+                    (col/f64-column [1.0e308 1.0e308 1.0e308]))]
+    (t/is (thrown-with-msg? Exception #"overflow" (g/dijkstra gr 0)))))
+
+(t/deftest pagerank-empty-graph-returns-empty-table
+  (let [gr (g/graph (col/i64-column []) (col/i64-column []))
+        r  (g/pagerank gr)]
+    (t/is (zero? (tbl/nrows r)))
+    (t/is (some? (tbl/col r :node)))
+    (t/is (some? (tbl/col r :rank)))))
 
 ;; ════════════════════════════════════════════════════════════════════════
 ;; BFS
