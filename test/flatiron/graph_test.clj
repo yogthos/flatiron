@@ -153,6 +153,52 @@
     (t/is (= 30.0 (nbrs 3)))))
 
 ;; ════════════════════════════════════════════════════════════════════════
+;; Construction validation
+;; ════════════════════════════════════════════════════════════════════════
+
+(t/deftest graph-rejects-negative-node-ids
+  (t/is (thrown-with-msg? Exception #"node id"
+                          (g/graph (col/i64-column [-1 0]) (col/i64-column [0 1]))))
+  (t/is (thrown-with-msg? Exception #"node id"
+                          (g/graph (col/i64-column [0 1]) (col/i64-column [1 -1])))))
+
+(t/deftest graph-rejects-node-ids-outside-n-nodes
+  (t/is (thrown-with-msg? Exception #"node id"
+                          (g/graph (col/i64-column [0]) (col/i64-column [1]) nil 1))))
+
+(t/deftest graph-rejects-negative-weights
+  "A negative two-node cycle used to livelock dijkstra; rejected at build."
+  (t/is (thrown-with-msg? Exception #"weight"
+                          (g/graph (col/i64-column [0 1])
+                                   (col/i64-column [1 0])
+                                   (col/f64-column [1.0 -1.0])))))
+
+(t/deftest graph-rejects-non-finite-weights
+  (doseq [w [##NaN ##Inf ##-Inf]]
+    (t/is (thrown-with-msg? Exception #"weight"
+                            (g/graph (col/i64-column [0]) (col/i64-column [1])
+                                     (col/f64-column [w]))))))
+
+(t/deftest graph-allows-zero-weights
+  (let [gr (g/graph (col/i64-column [0 1]) (col/i64-column [1 0])
+                    (col/f64-column [0.0 0.0]))
+        d  (tbl/col (g/dijkstra gr 0) :distance)]
+    (t/is (= 0.0 (col/-get-double d 0)))
+    (t/is (= 0.0 (col/-get-double d 1)))))
+
+(t/deftest build-graph-missing-src-throws
+  (let [tb (tbl/table [:dst] [(col/i64-column [1])])]
+    (t/is (thrown-with-msg? Exception #":src" (g/build-graph tb)))
+    (t/is (= :src (:column (try (g/build-graph tb)
+                                (catch Exception e (ex-data e))))))))
+
+(t/deftest build-graph-missing-dst-throws
+  (let [tb (tbl/table [:src] [(col/i64-column [0])])]
+    (t/is (thrown-with-msg? Exception #":dst" (g/build-graph tb)))
+    (t/is (= :dst (:column (try (g/build-graph tb)
+                                (catch Exception e (ex-data e))))))))
+
+;; ════════════════════════════════════════════════════════════════════════
 ;; BFS
 ;; ════════════════════════════════════════════════════════════════════════
 

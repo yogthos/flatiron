@@ -61,23 +61,45 @@
                           0
                           (let [mx (volatile! 0)]
                             (dotimes [i n-edges] (vswap! mx max (aget src i) (aget dst i)))
-                            (unchecked-inc @mx)))))
-           wts (when weight-col
-                 (let [^F64Column wc weight-col
-                       ^doubles wd (.data wc) wo (.offset wc)
-                       out (double-array n-edges)]
-                   (dotimes [i n-edges] (aset out i (aget wd (+ wo i))))
-                   out))
-           [fo ft fw] (build-csr-w src dst wts n-edges nn)
-           [ro rt _]  (build-csr-w dst src nil n-edges nn)]
-       (Graph. fo ft ro rt nn n-edges fw)))))
+                            (unchecked-inc @mx)))))]
+       (dotimes [i n-edges]
+         (let [s (aget src i) d (aget dst i)]
+           (when (or (neg? s) (>= s nn) (neg? d) (>= d nn))
+             (throw (ex-info "node id out of range"
+                             {:type :invalid-node-id
+                              :edge i :src s :dst d :n-nodes nn})))))
+       (let [wts (when weight-col
+                   (let [^F64Column wc weight-col
+                         ^doubles wd (.data wc) wo (.offset wc)
+                         out (double-array n-edges)]
+                     (dotimes [i n-edges]
+                       (let [w (aget wd (+ wo i))]
+                         (when-not (and (Double/isFinite w) (>= w 0.0))
+                           (throw (ex-info "edge weight must be finite and non-negative"
+                                           {:type :invalid-weight
+                                            :edge i :weight w
+                                            :src (aget src i) :dst (aget dst i)})))
+                         (aset out i w)))
+                     out))
+             [fo ft fw] (build-csr-w src dst wts n-edges nn)
+             [ro rt _]  (build-csr-w dst src nil n-edges nn)]
+         (Graph. fo ft ro rt nn n-edges fw))))))
 
 ;; ── build-graph ───────────────────────────────────────────────────────
 (defn build-graph
   "Build a graph from a table with :src and :dst columns (and an optional
    :weight column). See `graph` for the column-based constructor."
   [table & {:keys [n-nodes]}]
-  (graph (tbl/col table :src) (tbl/col table :dst) (tbl/col table :weight) n-nodes))
+  (let [require-col (fn [kw]
+                      (or (tbl/col table kw)
+                          (throw (ex-info (str "build-graph requires a " kw " column")
+                                          {:type :missing-column
+                                           :column kw
+                                           :schema (vec (.schema ^flatiron.table.Table table))}))))]
+    (graph (require-col :src)
+           (require-col :dst)
+           (tbl/col table :weight)
+           n-nodes)))
 
 (defn degree [^Graph g ^long n]
   (let [^longs off (.fwd-offsets g)]
