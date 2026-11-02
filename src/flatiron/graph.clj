@@ -10,6 +10,13 @@
                   ^long n-nodes ^long n-edges ^doubles weights])
 
 ;; ── Build helpers ─────────────────────────────────────────────────────
+(defn- type-desc
+  "Type tag for a column, or the class name for non-column values."
+  [x]
+  (if (satisfies? col/PColumn x)
+    (col/-type-tag x)
+    (when x (.getName (class x)))))
+
 (defn- build-csr-w
   "Build a CSR keyed by `key-arr` (one entry per edge). `tgt-arr` holds the
    adjacency target per edge, and `wt-arr` (optional) the matching weights.
@@ -59,18 +66,18 @@
   ([src-col dst-col] (graph src-col dst-col nil nil))
   ([src-col dst-col weight-col] (graph src-col dst-col weight-col nil))
   ([src-col dst-col weight-col n-nodes]
-   (when-not (instance? I64Column src-col)
-     (throw (ex-info "src column must be :i64"
-                     {:type :invalid-column-type :column :src
-                      :actual (when src-col (col/-type-tag src-col))})))
-   (when-not (instance? I64Column dst-col)
-     (throw (ex-info "dst column must be :i64"
-                     {:type :invalid-column-type :column :dst
-                      :actual (when dst-col (col/-type-tag dst-col))})))
-   (when (and weight-col (not (instance? F64Column weight-col)))
-     (throw (ex-info "weight column must be :f64"
-                     {:type :invalid-column-type :column :weight
-                      :actual (col/-type-tag weight-col)})))
+    (when-not (instance? I64Column src-col)
+      (throw (ex-info "src column must be :i64"
+                      {:type :invalid-column-type :column :src
+                       :actual (type-desc src-col)})))
+    (when-not (instance? I64Column dst-col)
+      (throw (ex-info "dst column must be :i64"
+                      {:type :invalid-column-type :column :dst
+                       :actual (type-desc dst-col)})))
+    (when (and weight-col (not (instance? F64Column weight-col)))
+      (throw (ex-info "weight column must be :f64"
+                      {:type :invalid-column-type :column :weight
+                       :actual (type-desc weight-col)})))
    (let [^I64Column sc src-col
          ^I64Column dc dst-col
          n-edges (.len sc)
@@ -286,15 +293,17 @@
   "Single-source shortest paths from `start` over edge weights. Edges without
    weights count as weight 1.0. Requires nonnegative weights, which `graph`
    enforces at construction; a negative cycle would otherwise never settle.
-   Throws ex-info (:type :distance-overflow) if a path distance exceeds the
-   double range. Returns a table of [:node :distance]; nodes that are
-   unreachable have null distance."
+   Throws ex-info (:type :distance-overflow) for a node whose shortest-path
+   distance exceeds the double range; overflowing candidates that are not the
+   shortest path are ignored. Returns a table of [:node :distance]; nodes
+   that are unreachable have null distance."
   [^Graph g ^long start]
   (let [nn (.n-nodes g)
         ^longs fo (.fwd-offsets g)
         ^longs ft (.fwd-targets g)
         ^doubles wts (.weights g)
-        dist (double-array nn)]
+        dist (double-array nn)
+        ovf  (boolean-array nn)]
     (java.util.Arrays/fill dist Double/POSITIVE_INFINITY)
     (when (and (>= start 0) (< start nn))
       (aset dist start 0.0)
@@ -310,20 +319,26 @@
                   u   (long (nth top 1))]
               ;; Skip stale heap entries left behind by a relaxation.
               (when (<= d (aget dist u))
-                  (loop [j (aget fo u)]
-                    (when (< j (aget fo (unchecked-inc u)))
-                      (let [v  (aget ft j)
-                            w  (if wts (aget wts j) 1.0)
-                            nd (+ d w)]
-                        (when (Double/isInfinite nd)
-                          (throw (ex-info "shortest-path distance overflow"
-                                          {:type :distance-overflow :node v
-                                           :via u :dist d :weight w})))
+                (loop [j (aget fo u)]
+                  (when (< j (aget fo (unchecked-inc u)))
+                    (let [v  (aget ft j)
+                          w  (if wts (aget wts j) 1.0)
+                          nd (+ d w)]
+                      (if (Double/isInfinite nd)
+                        ;; An overflowing candidate can never improve a finite
+                        ;; distance; remember it only for nodes with no finite
+                        ;; path yet, and decide after traversal.
+                        (when (Double/isInfinite (aget dist v))
+                          (aset ovf v true))
                         (when (< nd (aget dist v))
                           (aset dist v nd)
-                          (.add pq [nd v])))
-                      (recur (unchecked-inc j))))))
+                          (.add pq [nd v]))))
+                    (recur (unchecked-inc j))))))
             (recur)))))
+    (dotimes [i nn]
+      (when (and (aget ovf i) (Double/isInfinite (aget dist i)))
+        (throw (ex-info "shortest-path distance overflow"
+                        {:type :distance-overflow :node i}))))
     (let [nc (long-array nn)
           dc (double-array nn)
           hn (volatile! false)]

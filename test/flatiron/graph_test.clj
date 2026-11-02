@@ -218,7 +218,21 @@
                           (g/graph (col/i64-column [0]) (col/str-column ["b"]))))
   (t/is (thrown-with-msg? Exception #"weight column must be :f64"
                           (g/graph (col/i64-column [0]) (col/i64-column [1])
-                                   (col/i64-column [5])))))
+                                   (col/i64-column [5]))))
+  ;; Non-column values must get the same structured ex-info, not a protocol
+  ;; IllegalArgumentException from -type-tag.
+  (t/is (thrown-with-msg? Exception #"src column must be :i64"
+                          (g/graph [0 1] (col/i64-column [1 0]))))
+  (t/is (thrown-with-msg? Exception #"dst column must be :i64"
+                          (g/graph (col/i64-column [0 1]) [1 0])))
+  (t/is (thrown-with-msg? Exception #"weight column must be :f64"
+                          (g/graph (col/i64-column [0 1]) (col/i64-column [1 0])
+                                   [1.0 2.0])))
+  (let [ex (try (g/graph [0 1] (col/i64-column [1 0]))
+                (catch Exception e e))]
+    (t/is (= :invalid-column-type (:type (ex-data ex))))
+    (t/is (= "clojure.lang.PersistentVector" (:actual (ex-data ex)))
+          "non-column values report their class name")))
 
 (t/deftest graph-rejects-bad-explicit-n-nodes
   (t/is (thrown-with-msg? Exception #"n-nodes out of range"
@@ -239,6 +253,17 @@
   (let [gr (g/graph (col/i64-column [0 1 2]) (col/i64-column [1 2 0])
                     (col/f64-column [1.0e308 1.0e308 1.0e308]))]
     (t/is (thrown-with-msg? Exception #"overflow" (g/dijkstra gr 0)))))
+
+(t/deftest dijkstra-overflow-ignores-non-shortest-paths
+  ;; 0->2 direct is 1.7e308 (finite); the 0->1->2 route overflows and must
+  ;; not abort the search — it cannot improve a finite distance.
+  (let [gr (g/graph (col/i64-column [0 0 1])
+                    (col/i64-column [1 2 2])
+                    (col/f64-column [1.0e308 1.7e308 1.0e308]))
+        d  (tbl/col (g/dijkstra gr 0) :distance)]
+    (t/is (= 0.0     (col/-get-double d 0)))
+    (t/is (= 1.0e308 (col/-get-double d 1)))
+    (t/is (= 1.7e308 (col/-get-double d 2)))))
 
 (t/deftest pagerank-empty-graph-returns-empty-table
   (let [gr (g/graph (col/i64-column []) (col/i64-column []))
