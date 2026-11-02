@@ -10,6 +10,13 @@
                   ^long n-nodes ^long n-edges ^doubles weights])
 
 ;; ── Build helpers ─────────────────────────────────────────────────────
+(defn- type-desc
+  "Type tag for a column, or the class name for non-column values."
+  [x]
+  (if (satisfies? col/PColumn x)
+    (col/-type-tag x)
+    (when x (.getName (class x)))))
+
 (defn- build-csr-w
   "Build a CSR keyed by `key-arr` (one entry per edge). `tgt-arr` holds the
    adjacency target per edge, and `wt-arr` (optional) the matching weights.
@@ -43,51 +50,123 @@
 (defn graph
   "Build a graph from a source and a target I64 column (one edge per row).
    An optional F64 weight column gives per-edge weights. `n-nodes` overrides
-   the inferred node count (otherwise it is max node id + 1)."
+   the inferred node count (otherwise it is max node id + 1).
+
+   Node ids must fall in [0, n-nodes) and weights must be finite and
+   nonnegative; violations throw ex-info (:type :invalid-node-id or
+   :invalid-weight) naming the offending edge. The nonnegative rule is what
+   lets dijkstra terminate on every input, since a negative cycle would
+   relax forever.
+
+   src and dst must be I64 columns of equal length, weight (when given) an
+   F64 column of the same length, and an explicit n-nodes must be nonnegative
+   and below the JVM array-length limit (Integer/MAX_VALUE); violations throw
+   ex-info (:type :invalid-column-type, :length-mismatch, or
+   :invalid-n-nodes)."
   ([src-col dst-col] (graph src-col dst-col nil nil))
   ([src-col dst-col weight-col] (graph src-col dst-col weight-col nil))
   ([src-col dst-col weight-col n-nodes]
+    (when-not (instance? I64Column src-col)
+      (throw (ex-info "src column must be :i64"
+                      {:type :invalid-column-type :column :src
+                       :actual (type-desc src-col)})))
+    (when-not (instance? I64Column dst-col)
+      (throw (ex-info "dst column must be :i64"
+                      {:type :invalid-column-type :column :dst
+                       :actual (type-desc dst-col)})))
+    (when (and weight-col (not (instance? F64Column weight-col)))
+      (throw (ex-info "weight column must be :f64"
+                      {:type :invalid-column-type :column :weight
+                       :actual (type-desc weight-col)})))
    (let [^I64Column sc src-col
          ^I64Column dc dst-col
          n-edges (.len sc)
          ^longs sd (.data sc) so (.offset sc)
          ^longs dd (.data dc) do (.offset dc)
          src (long-array n-edges) dst (long-array n-edges)]
+     (when-not (= n-edges (.len dc))
+       (throw (ex-info "src and dst columns must have equal lengths"
+                       {:type :length-mismatch :src-len n-edges :dst-len (.len dc)})))
+     (when (and weight-col (not= n-edges (col/-len weight-col)))
+       (throw (ex-info "weight column must match edge count"
+                       {:type :length-mismatch :edge-count n-edges
+                        :weight-len (col/-len weight-col)})))
      (dotimes [i n-edges]
        (aset src i (aget sd (+ so i)))
        (aset dst i (aget dd (+ do i))))
-     (let [nn (long (or n-nodes
-                        (if (zero? n-edges)
-                          0
-                          (let [mx (volatile! 0)]
-                            (dotimes [i n-edges] (vswap! mx max (aget src i) (aget dst i)))
-                            (unchecked-inc @mx)))))
-           wts (when weight-col
-                 (let [^F64Column wc weight-col
-                       ^doubles wd (.data wc) wo (.offset wc)
-                       out (double-array n-edges)]
-                   (dotimes [i n-edges] (aset out i (aget wd (+ wo i))))
-                   out))
-           [fo ft fw] (build-csr-w src dst wts n-edges nn)
-           [ro rt _]  (build-csr-w dst src nil n-edges nn)]
-       (Graph. fo ft ro rt nn n-edges fw)))))
+      (let [nn (long (or n-nodes
+                         (if (zero? n-edges)
+                           0
+                           (let [mx (volatile! 0)]
+                             (dotimes [i n-edges] (vswap! mx max (aget src i) (aget dst i)))
+                             (unchecked-inc @mx)))))]
+        (when (or (neg? nn) (>= nn Integer/MAX_VALUE))
+          (throw (ex-info "n-nodes out of range"
+                          {:type :invalid-n-nodes :n-nodes nn
+                           :limit (dec Integer/MAX_VALUE)})))
+        (dotimes [i n-edges]
+         (let [s (aget src i) d (aget dst i)]
+           (when (or (neg? s) (>= s nn) (neg? d) (>= d nn))
+             (throw (ex-info "node id out of range"
+                             {:type :invalid-node-id
+                              :edge i :src s :dst d :n-nodes nn})))))
+       (let [wts (when weight-col
+                   (let [^F64Column wc weight-col
+                         ^doubles wd (.data wc) wo (.offset wc)
+                         out (double-array n-edges)]
+                     (dotimes [i n-edges]
+                       (let [w (aget wd (+ wo i))]
+                         (when-not (and (Double/isFinite w) (>= w 0.0))
+                           (throw (ex-info "edge weight must be finite and non-negative"
+                                           {:type :invalid-weight
+                                            :edge i :weight w
+                                            :src (aget src i) :dst (aget dst i)})))
+                         (aset out i w)))
+                     out))
+             [fo ft fw] (build-csr-w src dst wts n-edges nn)
+             [ro rt _]  (build-csr-w dst src nil n-edges nn)]
+         (Graph. fo ft ro rt nn n-edges fw))))))
 
 ;; ── build-graph ───────────────────────────────────────────────────────
 (defn build-graph
   "Build a graph from a table with :src and :dst columns (and an optional
    :weight column). See `graph` for the column-based constructor."
   [table & {:keys [n-nodes]}]
-  (graph (tbl/col table :src) (tbl/col table :dst) (tbl/col table :weight) n-nodes))
+  (let [require-col (fn [kw]
+                      (or (tbl/col table kw)
+                          (throw (ex-info (str "build-graph requires a " kw " column")
+                                          {:type :missing-column
+                                           :column kw
+                                           :schema (vec (.schema ^flatiron.table.Table table))}))))]
+    (graph (require-col :src)
+           (require-col :dst)
+           (tbl/col table :weight)
+           n-nodes)))
 
-(defn degree [^Graph g ^long n]
+(defn- check-node-index [^Graph g ^long n]
+  (when (or (neg? n) (>= n (.n-nodes g)))
+    (throw (ex-info "node index out of range"
+                    {:type :invalid-node-index :node n :n-nodes (.n-nodes g)}))))
+
+(defn degree
+  "Out-degree of node n. Throws ex-info if n is outside [0, n-nodes)."
+  [^Graph g ^long n]
+  (check-node-index g n)
   (let [^longs off (.fwd-offsets g)]
     (unchecked-subtract (aget off (unchecked-inc n)) (aget off n))))
 
-(defn in-degree [^Graph g ^long n]
+(defn in-degree
+  "In-degree of node n. Throws ex-info if n is outside [0, n-nodes)."
+  [^Graph g ^long n]
+  (check-node-index g n)
   (let [^longs off (.rev-offsets g)]
     (unchecked-subtract (aget off (unchecked-inc n)) (aget off n))))
 
-(defn neighbors [^Graph g ^long n]
+(defn neighbors
+  "Lazy seq of [target weight] pairs for node n. Weights default to 1.0 when
+   the graph is unweighted. Throws ex-info if n is outside [0, n-nodes)."
+  [^Graph g ^long n]
+  (check-node-index g n)
   (let [^longs off (.fwd-offsets g) ^longs tgt (.fwd-targets g)
         ^doubles wts (.weights g) start (aget off n) end (aget off (unchecked-inc n))]
     (for [i (range start end)]
@@ -212,14 +291,19 @@
 
 (defn dijkstra
   "Single-source shortest paths from `start` over edge weights. Edges without
-   weights count as weight 1.0. Returns a table of [:node :distance]; nodes
+   weights count as weight 1.0. Requires nonnegative weights, which `graph`
+   enforces at construction; a negative cycle would otherwise never settle.
+   Throws ex-info (:type :distance-overflow) for a node whose shortest-path
+   distance exceeds the double range; overflowing candidates that are not the
+   shortest path are ignored. Returns a table of [:node :distance]; nodes
    that are unreachable have null distance."
   [^Graph g ^long start]
   (let [nn (.n-nodes g)
         ^longs fo (.fwd-offsets g)
         ^longs ft (.fwd-targets g)
         ^doubles wts (.weights g)
-        dist (double-array nn)]
+        dist (double-array nn)
+        ovf  (boolean-array nn)]
     (java.util.Arrays/fill dist Double/POSITIVE_INFINITY)
     (when (and (>= start 0) (< start nn))
       (aset dist start 0.0)
@@ -240,11 +324,21 @@
                     (let [v  (aget ft j)
                           w  (if wts (aget wts j) 1.0)
                           nd (+ d w)]
-                      (when (< nd (aget dist v))
-                        (aset dist v nd)
-                        (.add pq [nd v])))
+                      (if (Double/isInfinite nd)
+                        ;; An overflowing candidate can never improve a finite
+                        ;; distance; remember it only for nodes with no finite
+                        ;; path yet, and decide after traversal.
+                        (when (Double/isInfinite (aget dist v))
+                          (aset ovf v true))
+                        (when (< nd (aget dist v))
+                          (aset dist v nd)
+                          (.add pq [nd v]))))
                     (recur (unchecked-inc j))))))
             (recur)))))
+    (dotimes [i nn]
+      (when (and (aget ovf i) (Double/isInfinite (aget dist i)))
+        (throw (ex-info "shortest-path distance overflow"
+                        {:type :distance-overflow :node i}))))
     (let [nc (long-array nn)
           dc (double-array nn)
           hn (volatile! false)]

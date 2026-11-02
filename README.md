@@ -200,6 +200,8 @@ Flatiron includes a CSR (Compressed Sparse Row) graph engine. You build a graph 
   )
 ```
 
+Node IDs must be integers in `[0, n-nodes)` and weights must be finite, nonnegative doubles. The `src` and `dst` columns must be i64 of equal length, a weight column f64 of that same length, and an explicit `n-nodes` must be 0 up to the JVM array limit. Graph construction checks all of this and throws an `ex-info` naming the offending edge or column. The nonnegative-weight rule is what guarantees Dijkstra finishes, since a negative cycle would keep relaxing distances forever. Dijkstra also throws when a node's shortest-path distance overflows the double range — overflowing routes that aren't the shortest path are ignored.
+
 Available algorithms:
 
 - **BFS** — breadth-first search from a start node
